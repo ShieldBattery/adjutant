@@ -1,8 +1,8 @@
 # Deployment runbook
 
 The tracked `deployment/` directory is a self-contained runtime bundle: copy it to a Linux VM and
-pull the application images from GHCR. The Rust source and Dockerfile are not required on the VM,
-but a ShieldBattery checkout must exist at the absolute host path configured in `deployment/.env`.
+pull the application images from GHCR. The Rust source, Dockerfile, and ShieldBattery checkouts are
+not required on the VM; the bundled source synchronizer maintains them in a persistent volume.
 
 Tailscale runs inside the Compose stack: its sidecar provides private ShieldBattery connectivity
 and exposes the inspector through Tailnet-only HTTPS. No Tailscale host installation or published
@@ -43,16 +43,25 @@ cp tailscale.env.example tailscale.env
 chmod 600 .env adjutant.env datadog-mcp.env mcp.env tailscale.env
 ```
 
-Set the two GHCR image references and absolute ShieldBattery checkout path in `.env`. Fill in the
-Discord token, guild/channel IDs, exact bug-report webhook ID, public ShieldBattery origin, and a
-random UI password of at least 32 bytes in `adjutant.env`; put the dedicated read-only PostgreSQL
-URL in `mcp.env`. Put the dedicated read-only Datadog Service Access Token and the managed MCP
-hostname for your Datadog site in `datadog-mcp.env`. See the
+Set the two GHCR image references and review the source-sync organization, interval, depth,
+retention, and size settings in `.env`. Fill in the Discord token, guild/channel IDs, exact
+bug-report webhook ID, public ShieldBattery origin, and a random UI password of at least 32 bytes
+in `adjutant.env`; put the dedicated read-only PostgreSQL URL in `mcp.env`. Put the dedicated
+read-only Datadog Service Access Token and the managed MCP hostname for your Datadog site in
+`datadog-mcp.env`. See the
 [Datadog MCP guide](datadog-mcp.md) for the exact role and token setup. For example:
 
 ```sh
 openssl rand -hex 32
 ```
+
+`source-sync` uses no GitHub credential. It enumerates the configured organization's public
+repositories, requires the `ShieldBattery` repository, skips other empty repositories, keeps
+bounded-depth Git history, and publishes a new all-repository generation only after every fetch and
+checkout succeeds. Compose passes the same `JOB_TIMEOUT_SECONDS` to the bot and synchronizer, and
+the synchronizer rejects retention shorter than that timeout plus one synchronization interval.
+The defaults retain source generations for two hours around 30-minute diagnoses. See the
+[source-sync guide](source-sync.md) for its snapshot contract and operations.
 
 Set `SHIELDBATTERY_INTERNAL_URL` to the app server's directly Tailscale-reachable origin to enable
 automatic bug-report metadata and ZIP retrieval. Leaving it empty disables automatic retrieval;
@@ -65,7 +74,11 @@ for this long-lived node and put it in `tailscale.env`. Prefer a tagged node suc
 `TS_EXTRA_ARGS`. Tailnet policy should allow staff to reach this node on port 443, allow only
 approved staff/developers to reach its database MCP on port 8443, and allow this node to reach only
 ShieldBattery's private app-server/database ports. The VM's ordinary egress policy must also allow
-DNS and TCP 443 to the selected Datadog managed MCP hostname.
+DNS and TCP 443 to the selected Datadog managed MCP hostname, `api.github.com`, and `github.com`.
+The GitHub traffic comes from `source-sync` on Docker's ordinary network, not from the Tailnet or
+model-generated commands. The synchronizer constructs only those two GitHub destinations and
+disables redirects, but Docker Compose does not enforce an FQDN allowlist; use a VM firewall or
+outbound proxy if that restriction must be independently enforced.
 
 Create the database role and curated views described in [the database MCP guide](database-mcp.md).
 The MCP container is the only service that receives `mcp.env`; Codex and the Discord bot never see
@@ -96,7 +109,8 @@ developer endpoint. Leave it empty when using the agent-only Serve configuration
 
 ```sh
 docker compose pull
-docker compose up -d tailscale adjutant-mcp datadog-mcp-proxy
+docker compose up -d source-sync tailscale adjutant-mcp datadog-mcp-proxy
+docker compose logs --tail=100 source-sync
 docker compose logs --tail=100 adjutant-mcp
 docker compose logs --tail=100 datadog-mcp-proxy
 docker compose run --rm adjutant codex login --device-auth
@@ -108,9 +122,9 @@ GHCR initially creates packages as private. For private packages, run
 `read:packages`; packages made public in GitHub's package settings need no registry login. Keep
 this credential in Docker's credential store, not in the deployment env files.
 
-The `codex-home` named volume retains the login state across container updates. Compose's fixed
-project name is `adjutant`, so replacing or moving the bundle continues to use the same named
-volumes.
+The `codex-home` named volume retains the login state across container updates, while `source-repos`
+retains Git mirrors and published source generations. Compose's fixed project name is `adjutant`,
+so replacing or moving the bundle continues to use the same named volumes.
 
 Codex supports ChatGPT subscription login, and its documented headless flow is
 `codex login --device-auth`. OpenAI recommends API keys as the default for automation; this setup
@@ -143,18 +157,19 @@ continuing without production evidence.
 
 `CODEX_ENV_PASSTHROUGH` is the only path for extra environment variables into the Codex process.
 Adjutant rejects its Discord and UI secrets even if listed. Prefer short-lived or narrowly scoped
-MCP credentials, and do not give either production identity write access. The source tree is
-mounted read-only and Codex itself is always invoked with the read-only sandbox. That sandbox also
-denies networking to model-generated commands, which is a required boundary because the parent
-container shares the sidecar's Tailnet connection. Do not configure a custom network-enabled Codex
-permission profile for this deployment.
+MCP credentials, and do not give either production identity write access. `source-sync` is the sole
+writer to the source volume; the Adjutant container mounts its atomically published generations
+read-only. Codex itself is always invoked with the read-only sandbox. That sandbox also denies
+networking to model-generated commands, which is a required boundary because the parent container
+shares the sidecar's Tailnet connection. Do not configure a custom network-enabled Codex permission
+profile for this deployment.
 
 ## 5. Start and privately expose the UI
 
 ```sh
 docker compose up -d
 docker compose ps
-docker compose logs -f tailscale adjutant-mcp datadog-mcp-proxy adjutant
+docker compose logs -f source-sync tailscale adjutant-mcp datadog-mcp-proxy adjutant
 docker compose exec tailscale tailscale serve status
 ```
 
@@ -186,10 +201,13 @@ disabled on both ports. To keep MCP access local to Adjutant, set
   is not already present, copy its example, restrict it to mode `600`, and fill in the required
   values before running the same pull/up commands. In particular, deployments upgrading to the
   Datadog MCP integration must create and fill `datadog-mcp.env` first.
+- Upgrade from the old host-checkout deployment: remove the obsolete
+  `SHIELDBATTERY_HOST_SOURCE_PATH` setting from `.env` when convenient. Compose creates and fills
+  `source-repos` automatically; the old host checkout is no longer mounted or updated by Adjutant.
 - Stop: `docker compose down`. Compose gives active jobs up to 35 minutes to drain.
 - Back up: snapshot `adjutant-data` for requests, manifests, event JSONL, and final reports. Back up
-  `tailscale-state` if preserving the node identity matters. Extracted client bundles are not
-  persisted.
+  `tailscale-state` if preserving the node identity matters. `source-repos` is reproducible from
+  public GitHub and normally does not need backup. Extracted client bundles are not persisted.
 - Re-authenticate: rerun `docker compose run --rm adjutant codex login --device-auth`.
 - Database MCP: inspect `docker compose logs adjutant-mcp`; `/healthz` checks that the dedicated
   role can connect. Agent-initiated MCP calls and results also appear in the corresponding Codex
@@ -198,12 +216,21 @@ disabled on both ports. To keep MCP access local to Adjutant, set
   credential proxy is listening. Codex marks Datadog required and therefore fails a diagnosis
   visibly if upstream initialization or authentication fails. Rotate its token using the procedure
   in the [Datadog MCP guide](datadog-mcp.md).
+- Source synchronization: inspect `docker compose logs source-sync`. It discovers every non-empty
+  public repository in `SOURCE_SYNC_GITHUB_ORG`, fetches on `SOURCE_SYNC_INTERVAL_SECONDS`, and
+  publishes the whole organization as one consistent generation. A run records the selected commit
+  IDs from `.adjutant-source-manifest.json`. Restart `source-sync` to request an immediate refresh;
+  rebuilding or restarting Adjutant is unnecessary.
 - Network status: `docker compose exec tailscale tailscale status`; service health is visible in
-  `docker compose ps`. Adjutant's health check covers its UI and all three sidecar health endpoints.
+  `docker compose ps`. Adjutant's health check covers its UI and the three shared-network sidecar
+  health endpoints; `source-sync` reports its own snapshot freshness separately.
   This verifies that the node has a Tailnet IP, the database login can connect, and the Datadog proxy
   is listening—not end-to-end ShieldBattery or Datadog reachability. Use separate synthetic checks
   if those paths need proactive alerting.
 - Retention: `RUN_RETENTION_DAYS` is applied at startup. Client logs and dumps live only in per-run
   temporary storage and are removed after the process finishes.
-- Limits: if `JOB_TIMEOUT_SECONDS` is raised above 1800, raise Compose's `stop_grace_period` by at
-  least the same amount. Queued jobs are failed promptly on shutdown; only active jobs drain.
+- Limits: if `JOB_TIMEOUT_SECONDS` is raised above 1800, also keep
+  `SOURCE_SYNC_RETENTION_SECONDS` at least one sync interval above it and raise Compose's
+  `stop_grace_period` by at least the same amount. The source size settings use GitHub's
+  API-reported sizes as preflight guards; monitor or quota `source-repos` for a hard disk bound.
+  Queued jobs are failed promptly on shutdown; only active jobs drain.

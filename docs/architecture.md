@@ -1,6 +1,6 @@
 # Architecture
 
-Adjutant has four trust zones:
+Adjutant has five trust zones:
 
 1. Discord supplies untrusted requests and evidence.
 2. The orchestrator downloads and unpacks evidence under hard resource limits, stores an audit
@@ -12,6 +12,10 @@ Adjutant has four trust zones:
    database MCP accepts bounded read-only requests against curated views; the Datadog proxy is
    configured to forward only to the selected Datadog managed MCP and authenticates as a read-only
    service account.
+5. The source synchronizer has ordinary public GitHub egress, constructs requests only for the
+   fixed GitHub API/repository hosts, receives no Tailnet namespace or credentials, and has sole
+   write access to the persistent source volume. Adjutant mounts only atomically published
+   repository generations from that volume, read-only.
 
 On Linux, Adjutant marks its own process non-dumpable before reading configuration. Combined
 with the cleared/allowlisted child environment and dropped container capabilities, this prevents a
@@ -38,6 +42,13 @@ local files to it. Do not replace this sandbox with a network-enabled permission
 authenticates at the node boundary, so doing so would also grant the agent direct access to every
 destination allowed to `tag:adjutant`.
 
+Source synchronization is deliberately outside that namespace. It discovers bounded public
+repositories from the configured GitHub organization, updates private bare mirrors, materializes a
+complete commit-addressed generation of independent shallow clones, then atomically advances a
+`current` symlink. A diagnosis that has already entered its working directory continues using the
+old generation while later runs see the new one. Old generations outlive the maximum job duration
+before cleanup, so the updater never mutates or removes source beneath an active Codex process.
+
 The long-running process owns a bounded queue. Gateway handlers only validate and enqueue work;
 they never download evidence or wait for Codex. A semaphore caps active diagnoses. Per-job
 temporary directories are removed after completion, so user logs and dumps do not become part of
@@ -61,7 +72,7 @@ staff request + ZIP --/                                      |
                                                                       v
 Discord output <- final report <- Codex JSONL runner <-> SQLite -> inspection UI
                                        |
-                                       +-> source tree
+                                       +-> read-only source generation <- public GitHub synchronizer
                                        +-> database MCP -> curated PostgreSQL views
                                        +-> credential proxy -> Datadog managed MCP
 ```

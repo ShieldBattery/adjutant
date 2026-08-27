@@ -22,6 +22,9 @@ errors.
 - Codex runs with `codex exec --ephemeral --json --sandbox read-only` against a read-only source
   mount and approved read-only MCPs. Its model-generated commands have no network access, even
   though the parent service shares the sidecar's Tailnet connection.
+- A credential-free Rust source synchronizer discovers the organization's public GitHub
+  repositories and atomically refreshes persistent, read-only snapshots without rebuilding or
+  redeploying Adjutant.
 - A Tailscale sidecar gives the service private ShieldBattery egress and exposes the inspector with
   Tailnet-only HTTPS; no application port is published on the Docker host.
 - A credential-isolated Rust MCP gives Codex purpose-built user/game diagnostics plus bounded
@@ -30,14 +33,15 @@ errors.
 - A loopback-only credential proxy connects Codex to Datadog's managed MCP with a dedicated
   read-only service identity; neither Codex nor model-generated commands receive its token.
 - `deployment/` is a copyable, image-only VM bundle, and the GitHub Actions workflow publishes the
-  bot and MCP Dockerfile targets as separate GHCR images.
+  bot/source-sync and MCP Dockerfile targets as separate GHCR images.
 - Results are posted inline when possible and attached as `diagnosis.md` when too long for Discord.
 - The container includes Mozilla's Rust `minidump-stackwalk` utility for Windows crash dumps.
 - Startup recovery marks interrupted runs failed, and old run history is pruned automatically.
 
 See [architecture](docs/architecture.md), the [deployment runbook](docs/deployment.md), the
 [copyable VM bundle](deployment/README.md), the [database MCP guide](docs/database-mcp.md), the
-[Datadog MCP guide](docs/datadog-mcp.md), and the deployment's tracked configuration examples.
+[Datadog MCP guide](docs/datadog-mcp.md), the [source-sync guide](docs/source-sync.md), and the
+deployment's tracked configuration examples.
 
 ## Local verification
 
@@ -56,8 +60,10 @@ Codex runs with a read-only filesystem sandbox and no approval flow. The child p
 explicit environment allowlist, and its checked-in Codex configuration exposes only approved
 read-only MCP tools. Database credentials exist only in the MCP container and the database role can
 select only curated non-sensitive views. The Datadog service token exists only in its proxy sidecar,
-whose service account lacks write permissions. Evidence is size-limited, extracted without trusting
-ZIP paths, and removed with the per-job temporary directory.
+whose service account lacks write permissions. The source synchronizer has public GitHub egress but
+no Tailnet connection or service credentials; Adjutant mounts its snapshot volume read-only.
+Evidence is size-limited, extracted without trusting ZIP paths, and removed with the per-job
+temporary directory.
 
 This is a diagnostic system, not a remediation system. It does not edit ShieldBattery, write to
 production data, or send messages anywhere except the configured Discord output channel.

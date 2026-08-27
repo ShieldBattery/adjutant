@@ -27,9 +27,10 @@ RUN apt-get update \
     && groupadd --gid 10001 adjutant \
     && useradd --uid 10001 --gid adjutant --home-dir /var/lib/adjutant --shell /bin/sh adjutant \
     && install -d -o adjutant -g adjutant /var/lib/adjutant/codex /var/lib/adjutant/data \
-    && install -d -o adjutant -g adjutant /workspace/shieldbattery
+    && install -d -o adjutant -g adjutant /workspace/shieldbattery /workspace/repos
 
 COPY --from=builder /build/target/release/adjutant /usr/local/bin/adjutant
+COPY --from=builder /build/target/release/adjutant-source-sync /usr/local/bin/adjutant-source-sync
 COPY --from=builder /opt/minidump/bin/minidump-stackwalk /usr/local/bin/minidump-stackwalk
 
 WORKDIR /workspace/shieldbattery

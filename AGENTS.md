@@ -26,6 +26,12 @@ between untrusted reports, the Codex runner, production credentials, and product
 - The Codex child must keep a read-only filesystem sandbox and network-disabled model-generated
   commands. Do not pass Discord, UI, Tailscale, database, or other service credentials into its
   environment.
+- `source-sync` is the sole writer to the persistent source volume. Its code constructs requests
+  only to the fixed public GitHub API/repository endpoints, receives no credentials or Tailnet
+  namespace, publishes complete generations atomically, and retains old generations longer than
+  the maximum diagnostic runtime. Adjutant must continue mounting that volume read-only. Docker's
+  ordinary network is not an FQDN egress firewall; deployments needing enforced domain-only egress
+  must add that at the VM firewall or proxy layer.
 - Only `adjutant-mcp` receives the production database URL. It must bind to loopback, use bounded
   read-only transactions, retain SQL validation, and operate through a database role limited to
   curated non-sensitive views. Query telemetry must not contain raw SQL or result data.
@@ -37,8 +43,9 @@ between untrusted reports, the Codex runner, production credentials, and product
 
 ## Workspace and deployment layout
 
-- The repository is a Rust 2024 workspace requiring Rust 1.98 or newer. The root package is the
-  Discord/orchestration service; `crates/adjutant-mcp` is the isolated PostgreSQL MCP server.
+- The repository is a Rust 2024 workspace requiring Rust 1.98 or newer. The root package contains
+  the Discord/orchestration service and source-sync utility; `crates/adjutant-mcp` is the isolated
+  PostgreSQL MCP server.
 - Keep Rust dependencies current and commit `Cargo.lock`. Review deliberately pinned container and
   CLI versions before updating them rather than changing them incidentally.
 - The Dockerfile's last stage is the MCP runtime. Compose must continue to select `runtime`
@@ -46,7 +53,7 @@ between untrusted reports, the Codex runner, production credentials, and product
 - `deployment/` is a self-contained, image-only VM bundle. Keep production build contexts out of
   `deployment/compose.yaml`; local builds belong in the repository-only `compose.build.yaml`.
 - Keep the top-level Compose project name `adjutant` so moving the deployment directory does not
-  orphan its persistent SQLite, Codex login, or Tailscale identity volumes.
+  orphan its persistent SQLite, source snapshots, Codex login, or Tailscale identity volumes.
 - Adjutant, the database MCP, and the Datadog credential proxy use
   `network_mode: service:tailscale`; they intentionally share networking, but not the Tailscale
   state volume, LocalAPI socket, auth key, capabilities, or PID namespace.

@@ -46,6 +46,51 @@ services:
       retries: 6
       start_period: 15s
 
+  source-sync:
+    image: ${ADJUTANT_IMAGE:?ADJUTANT_IMAGE must be set in .env}
+    pull_policy: always
+    command:
+      - /usr/local/bin/adjutant-source-sync
+    init: true
+    restart: unless-stopped
+    environment:
+      SOURCE_SYNC_ROOT: /workspace/repos
+      SOURCE_SYNC_GITHUB_ORG: ${SOURCE_SYNC_GITHUB_ORG:-ShieldBattery}
+      SOURCE_SYNC_INTERVAL_SECONDS: ${SOURCE_SYNC_INTERVAL_SECONDS:-900}
+      SOURCE_SYNC_GIT_DEPTH: ${SOURCE_SYNC_GIT_DEPTH:-200}
+      SOURCE_SYNC_RETENTION_SECONDS: ${SOURCE_SYNC_RETENTION_SECONDS:-7200}
+      SOURCE_SYNC_JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-1800}
+      SOURCE_SYNC_MAX_REPOSITORIES: ${SOURCE_SYNC_MAX_REPOSITORIES:-100}
+      SOURCE_SYNC_MAX_REPOSITORY_KIB: ${SOURCE_SYNC_MAX_REPOSITORY_KIB:-1048576}
+      SOURCE_SYNC_MAX_TOTAL_KIB: ${SOURCE_SYNC_MAX_TOTAL_KIB:-4194304}
+    networks:
+      - source-egress
+    volumes:
+      - source-repos:/workspace/repos
+    read_only: true
+    cap_drop:
+      - ALL
+    # Needed only by the image entrypoint for its one-way drop to UID/GID 10001.
+    cap_add:
+      - SETGID
+      - SETUID
+    pids_limit: 128
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        - CMD
+        - /usr/local/bin/adjutant-source-sync
+        - healthcheck
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      # Initial organization mirroring can take a while; a successful check ends this early.
+      start_period: 30m
+
   adjutant-mcp:
     image: ${ADJUTANT_MCP_IMAGE:?ADJUTANT_MCP_IMAGE must be set in .env}
     pull_policy: always
@@ -132,25 +177,23 @@ services:
         condition: service_healthy
       datadog-mcp-proxy:
         condition: service_healthy
+      source-sync:
+        condition: service_healthy
     env_file: adjutant.env
     environment:
       ADJUTANT_DATABASE_PATH: /var/lib/adjutant/data/adjutant.sqlite3
       # Serve reaches this over the shared loopback interface; port 8080 is not exposed directly.
       ADJUTANT_UI_BIND: 127.0.0.1:8080
       CODEX_HOME: /var/lib/adjutant/codex
-      SHIELDBATTERY_SOURCE_DIR: /workspace/shieldbattery
+      JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-1800}
+      SHIELDBATTERY_SOURCE_DIR: /workspace/repos/current/ShieldBattery
     volumes:
       - adjutant-data:/var/lib/adjutant/data
       - codex-home:/var/lib/adjutant/codex
+      # source-sync is the sole writer; Codex and the orchestrator receive immutable generations.
+      - source-repos:/workspace/repos:ro
       # Keep tool policy reviewable while auth.json remains in the private named volume.
       - ./config/codex.toml:/var/lib/adjutant/codex/config.toml:ro
-      - type: bind
-        source: ${SHIELDBATTERY_HOST_SOURCE_PATH:?SHIELDBATTERY_HOST_SOURCE_PATH must be set in .env}
-        target: /workspace/shieldbattery
-        read_only: true
-        bind:
-          # A bad source path must fail instead of silently mounting an empty new directory.
-          create_host_path: false
     read_only: true
     cap_drop:
       - ALL
@@ -178,4 +221,9 @@ services:
 volumes:
   adjutant-data:
   codex-home:
+  source-repos:
   tailscale-state:
+
+networks:
+  # Keep the credential-free public updater off the service/Tailscale container network.
+  source-egress:

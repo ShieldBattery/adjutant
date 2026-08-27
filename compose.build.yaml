@@ -23,3 +23,23 @@ services:
         read_only: true
         bind:
           create_host_path: false
+    environment:
+      # Local runs use the adjacent live checkout; production uses source-sync generations.
+      SHIELDBATTERY_SOURCE_DIR: /workspace/shieldbattery
+    # The repository overlay uses the adjacent live checkout and must not wait for GitHub sync.
+    depends_on: !override
+      tailscale:
+        condition: service_healthy
+      adjutant-mcp:
+        condition: service_healthy
+      datadog-mcp-proxy:
+        condition: service_healthy
+
+  source-sync:
+    image: adjutant:local
+    pull_policy: build
+    build:
+      context: ..
+      target: runtime
+      args:
+        CODEX_VERSION: 0.150.1

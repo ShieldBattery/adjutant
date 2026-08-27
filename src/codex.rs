@@ -170,7 +170,18 @@ impl CodexRunner {
         } else {
             &workspace.root
         };
-        let prompt = build_prompt(request, workspace, source_available);
+        let source_manifest_available = source_available
+            && self
+                .config
+                .shieldbattery_source_dir
+                .parent()
+                .is_some_and(|parent| parent.join(".adjutant-source-manifest.json").is_file());
+        let prompt = build_prompt(
+            request,
+            workspace,
+            source_available,
+            source_manifest_available,
+        );
         let mut command = self.command(working_directory, &output_path, source_available);
         let mut child = command.spawn().with_context(|| {
             format!(
@@ -285,11 +296,23 @@ impl CodexRunner {
     }
 }
 
-fn build_prompt(request: &str, workspace: &EvidenceWorkspace, source_available: bool) -> String {
-    let source_note = if source_available {
-        "The current working directory is the read-only ShieldBattery source tree."
+fn build_prompt(
+    request: &str,
+    workspace: &EvidenceWorkspace,
+    source_available: bool,
+    source_manifest_available: bool,
+) -> String {
+    let source_note = if source_manifest_available {
+        "The current working directory is a read-only snapshot of the main ShieldBattery \
+repository. Consistent snapshots of the other public ShieldBattery organization repositories are \
+its siblings. Read the source manifest at ../.adjutant-source-manifest.json and use sibling \
+repositories when relevant; report the commit IDs that materially support the diagnosis."
+            .to_owned()
+    } else if source_available {
+        "The current working directory is the read-only ShieldBattery source tree.".to_owned()
     } else {
         "The ShieldBattery source tree is unavailable. State that limitation where it affects confidence."
+            .to_owned()
     };
     format!(
         r"You are Adjutant, ShieldBattery's diagnostic agent. Diagnose the incident; do not fix code, edit files, mutate production data, or send external messages.
