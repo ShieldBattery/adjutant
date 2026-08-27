@@ -63,4 +63,4 @@ run data and is the only unauthenticated route.
 Adjutant intentionally does not prescribe a broad database password or Datadog API key for the
 Codex child. Configure a dedicated `CODEX_HOME` with read-only MCP tools and narrowly scoped service
 credentials. `CODEX_ENV_PASSTHROUGH` is an explicit allowlist; Adjutant rejects attempts to pass its
-Discord, ShieldBattery, or UI credentials into Codex.
+Discord or UI credentials into Codex.

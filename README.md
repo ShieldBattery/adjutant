@@ -18,7 +18,7 @@ not available from Codex and is not claimed to be captured.
 - Staff messages and Discord attachments trigger one-off diagnoses.
 - Queue depth, concurrency, download size, aggregate ZIP expansion/file count, event history, process
   count, memory, CPU, and end-to-end runtime are bounded.
-- ShieldBattery service credentials never enter the Codex child environment.
+- Discord and inspection-UI secrets never enter the Codex child environment.
 - Codex runs with `codex exec --ephemeral --json --sandbox read-only` against a read-only source
   mount and optional read-only MCPs.
 - Results are posted inline when possible and attached as `diagnosis.md` when too long for Discord.

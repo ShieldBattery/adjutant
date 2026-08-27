@@ -2,8 +2,8 @@
 
 Adjutant needs a stable service-to-service replacement for the current staff browser API. The
 existing Discord webhook includes `/admin/bug-reports/<uuid>`, while the private ZIP remains in the
-ShieldBattery file store. A rotating staff JWT or direct object-store credentials should not be
-placed in the bot.
+ShieldBattery file store. Adjutant should reach this API directly through the Tailnet, without a
+staff JWT, application bearer token, or direct object-store credentials.
 
 ## Requested endpoints
 
@@ -38,37 +38,35 @@ would reduce peak memory.
 
 ## Access boundary
 
-Use both controls:
+Tailscale is the authorization boundary for these routes. Enforce that boundary with both network
+placement and ACLs:
 
 - Reject any request containing `X-Forwarded-For`, matching the existing `/metrics` convention so
   requests arriving through public nginx cannot reach the handler.
-- Disable the routes unless `SB_INTERNAL_API_TOKEN` is configured and require
-  `Authorization: Bearer <token>` using a constant-time comparison. Tailscale ACLs should restrict
-  the Adjutant VM to app-server port 80 as well.
+- Restrict the app-server port with Tailscale ACLs so only the Adjutant VM can reach it.
 
 The app-server listener must not be directly reachable from the public internet. Keep the public
 firewall limited to nginx, and expose the direct app port only on the Docker/private/Tailscale path.
 The absence of `X-Forwarded-For` is a defense-in-depth signal, not an adequate network boundary by
-itself. If that listener cannot be made private, use a separate tailnet-only listener or mTLS peer
-authentication for these routes.
+itself. If that listener cannot be made private, use a separate tailnet-only listener. Do not expose
+these Tailnet-authorized routes through a publicly reachable listener.
 
-Pass `SB_INTERNAL_API_TOKEN` only to the Node app-server container. Do not log the Authorization
-header. Set `Cache-Control: private, no-store` and `X-Content-Type-Options: nosniff` on successful
-responses.
+Requests do not need application-layer authorization. Set `Cache-Control: private, no-store` and
+`X-Content-Type-Options: nosniff` on successful responses.
 
 Recommended status codes:
 
-- `401` for a missing or invalid bearer token on a direct connection
 - `403` for a reverse-proxied request
-- `404` for a malformed/unknown UUID or when the feature is disabled
+- `404` for a malformed or unknown UUID
 - `405` for non-GET methods
 - `410` when `logs_deleted` is true
 
 ## Acceptance tests
 
-- Exact bearer tokens succeed; missing, prefixed/suffixed, and wrong tokens fail.
+- A request from the authorized Adjutant Tailnet peer succeeds without an application credential;
+  other peers are denied by the Tailscale ACL.
 - Metadata and `/logs` paths accept a UUID and reject extended/malformed paths.
-- Requests with `X-Forwarded-For` fail even with a valid token.
+- Requests with `X-Forwarded-For` fail.
 - An unknown report is `404`; deleted logs are `410`.
 - The ZIP response matches the stored bytes and has no-store/nosniff headers.
 - Requests never pass through to the public route stack after the internal handler responds.
@@ -77,5 +75,4 @@ Adjutant configuration maps directly to this contract:
 
 ```dotenv
 SHIELDBATTERY_INTERNAL_URL=http://sb-prod
-SHIELDBATTERY_INTERNAL_TOKEN=<same high-entropy value>
 ```

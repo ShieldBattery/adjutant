@@ -10,7 +10,6 @@ use uuid::Uuid;
 pub struct ShieldBatteryClient {
     http: Client,
     base_url: Url,
-    token: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -31,21 +30,17 @@ struct BugReportResponse {
 }
 
 impl ShieldBatteryClient {
-    pub fn new(base_url: Url, token: String) -> Result<Self> {
+    pub fn new(base_url: Url) -> Result<Self> {
         let http = Client::builder()
             .redirect(Policy::none())
-            // Never put the private bearer credential onto a system-configured HTTP proxy.
+            // Keep the request on the direct Tailnet path instead of a system-configured proxy.
             .no_proxy()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(60))
             .user_agent(concat!("adjutant/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("failed to create ShieldBattery HTTP client")?;
-        Ok(Self {
-            http,
-            base_url,
-            token,
-        })
+        Ok(Self { http, base_url })
     }
 
     pub async fn get_report(&self, report_id: Uuid) -> Result<BugReport> {
@@ -53,7 +48,6 @@ impl ShieldBatteryClient {
         let response = self
             .http
             .get(url)
-            .bearer_auth(&self.token)
             .send()
             .await
             .context("failed to request ShieldBattery bug report metadata")?;
@@ -77,7 +71,6 @@ impl ShieldBatteryClient {
         let response = self
             .http
             .get(self.endpoint(report_id, true))
-            .bearer_auth(&self.token)
             .send()
             .await
             .context("failed to request ShieldBattery bug report logs")?;

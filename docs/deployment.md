@@ -36,11 +36,11 @@ origin, and a random UI password of at least 32 bytes. For example:
 openssl rand -hex 32
 ```
 
-Leave both `SHIELDBATTERY_INTERNAL_URL` and `SHIELDBATTERY_INTERNAL_TOKEN` empty until the internal
-API in [the developer handoff](shieldbattery-internal-api.md) has been implemented. One-off staff
-requests with Discord attachments work without it; automatic bug-report ZIP retrieval does not.
-Once the API exists, use the app server's Tailscale-reachable origin and the same high-entropy token
-on both sides.
+Leave `SHIELDBATTERY_INTERNAL_URL` empty until the internal API in
+[the developer handoff](shieldbattery-internal-api.md) has been implemented. One-off staff requests
+with Discord attachments work without it; automatic bug-report ZIP retrieval does not. Once the API
+exists, set it to the app server's directly Tailscale-reachable origin. Tailscale ACLs are the
+authorization boundary; there is no second application bearer token.
 
 Set `ADJUTANT_UI_BASE_URL` to the HTTPS URL produced by Tailscale Serve so Discord status messages
 link directly to the matching inspected run.
@@ -78,10 +78,9 @@ read-only Datadog, database, or internal telemetry tools. Mark mandatory MCPs as
 diagnosis fails visibly instead of silently continuing without production evidence.
 
 `CODEX_ENV_PASSTHROUGH` is the only path for extra environment variables into the Codex process.
-Adjutant rejects its Discord, internal ShieldBattery, and UI secrets even if listed. Prefer
-short-lived or narrowly scoped credentials, and do not give the agent a database principal capable
-of writes. The source tree is mounted read-only and Codex itself is always invoked with the
-read-only sandbox.
+Adjutant rejects its Discord and UI secrets even if listed. Prefer short-lived or narrowly scoped
+MCP credentials, and do not give the agent a database principal capable of writes. The source tree
+is mounted read-only and Codex itself is always invoked with the read-only sandbox.
 
 ## 5. Start and privately expose the UI
 

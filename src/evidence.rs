@@ -112,8 +112,7 @@ impl EvidenceCollector {
         let shieldbattery = config
             .shieldbattery_internal_url
             .clone()
-            .zip(config.shieldbattery_internal_token.clone())
-            .map(|(url, token)| ShieldBatteryClient::new(url, token))
+            .map(ShieldBatteryClient::new)
             .transpose()?;
         Ok(Self {
             http,
@@ -189,7 +188,7 @@ impl EvidenceCollector {
         archive_budget: &mut ArchiveBudget,
     ) -> Result<(BugReport, Vec<ManifestEntry>)> {
         let client = self.shieldbattery.as_ref().context(
-            "automatic bug reports require SHIELDBATTERY_INTERNAL_URL and SHIELDBATTERY_INTERNAL_TOKEN; see docs/shieldbattery-internal-api.md",
+            "automatic bug reports require SHIELDBATTERY_INTERNAL_URL; see docs/shieldbattery-internal-api.md",
         )?;
         let report = client.get_report(report_id).await?;
         let metadata = serde_json::to_string_pretty(&report)?;

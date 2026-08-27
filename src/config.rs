@@ -7,11 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use url::Url;
 
-const PROTECTED_CHILD_VARIABLES: &[&str] = &[
-    "ADJUTANT_UI_TOKEN",
-    "DISCORD_TOKEN",
-    "SHIELDBATTERY_INTERNAL_TOKEN",
-];
+const PROTECTED_CHILD_VARIABLES: &[&str] = &["ADJUTANT_UI_TOKEN", "DISCORD_TOKEN"];
 
 #[derive(Clone)]
 pub struct Config {
@@ -24,7 +20,6 @@ pub struct Config {
     pub discord_allowed_role_ids: HashSet<u64>,
     pub shieldbattery_public_url: Url,
     pub shieldbattery_internal_url: Option<Url>,
-    pub shieldbattery_internal_token: Option<String>,
     pub codex_bin: String,
     pub codex_home: PathBuf,
     pub codex_profile: Option<String>,
@@ -52,18 +47,6 @@ impl Config {
         let shieldbattery_internal_url = optional("SHIELDBATTERY_INTERNAL_URL")
             .map(|value| parse_internal_url(&value))
             .transpose()?;
-        let shieldbattery_internal_token = optional("SHIELDBATTERY_INTERNAL_TOKEN");
-        if shieldbattery_internal_url.is_some() != shieldbattery_internal_token.is_some() {
-            bail!(
-                "SHIELDBATTERY_INTERNAL_URL and SHIELDBATTERY_INTERNAL_TOKEN must either both be set or both be unset"
-            );
-        }
-        if shieldbattery_internal_token
-            .as_ref()
-            .is_some_and(|token| token.len() < 32)
-        {
-            bail!("SHIELDBATTERY_INTERNAL_TOKEN must contain at least 32 bytes");
-        }
 
         let ui_token = required("ADJUTANT_UI_TOKEN")?;
         if ui_token.len() < 32 {
@@ -97,7 +80,6 @@ impl Config {
                 .collect::<Result<_>>()?,
             shieldbattery_public_url: parse_public_url(&required("SHIELDBATTERY_PUBLIC_URL")?)?,
             shieldbattery_internal_url,
-            shieldbattery_internal_token,
             codex_bin: optional("CODEX_BIN").unwrap_or_else(|| "codex".to_owned()),
             codex_home: optional("CODEX_HOME").map_or_else(default_codex_home, PathBuf::from),
             codex_profile: optional("CODEX_PROFILE"),
