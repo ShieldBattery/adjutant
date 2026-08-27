@@ -9,7 +9,7 @@ send one-off questions and attach ZIP files in the request channel.
 The repository is a Rust 2024 Cargo workspace containing the bot and a separate read-only database
 MCP. Each run is persisted to SQLite and can be inspected in a private, read-only web UI, including
 the evidence manifest, Codex JSONL events, tool calls, reasoning summaries, final report, and
-errors. Hidden chain-of-thought is not available from Codex and is not claimed to be captured.
+errors.
 
 ## What is implemented
 
