@@ -28,11 +28,13 @@ private channel ACL is the authorization boundary.
 ```sh
 cp .env.example .env
 cp .env.tailscale.example .env.tailscale
-chmod 600 .env .env.tailscale
+cp .env.mcp.example .env.mcp
+chmod 600 .env .env.tailscale .env.mcp
 ```
 
 Fill in the Discord token, guild/channel IDs, exact bug-report webhook ID, public ShieldBattery
-origin, and a random UI password of at least 32 bytes. For example:
+origin, a random UI password of at least 32 bytes, and the dedicated read-only PostgreSQL URL. For
+example:
 
 ```sh
 openssl rand -hex 32
@@ -47,8 +49,13 @@ authorization boundary; there is no second application bearer token.
 In the Tailscale admin console, enable MagicDNS and HTTPS, then generate a pre-authorized auth key
 for this long-lived node and put it in `.env.tailscale`. Prefer a tagged node such as
 `tag:adjutant`; define its tag owner first and put `--advertise-tags=tag:adjutant` in
-`TS_EXTRA_ARGS`. Tailnet policy should allow staff to reach this node on port 443 and allow this node
-to reach only ShieldBattery's private app-server port and any explicitly required MCP endpoints.
+`TS_EXTRA_ARGS`. Tailnet policy should allow staff to reach this node on port 443, allow only
+approved staff/developers to reach its database MCP on port 8443, and allow this node to reach only
+ShieldBattery's private app-server/database ports and any explicitly required MCP endpoints.
+
+Create the database role and curated views described in [the database MCP guide](database-mcp.md).
+The MCP container is the only service that receives `.env.mcp`; Codex and the Discord bot never see
+the database password.
 
 Bring up the sidecar first:
 
@@ -66,17 +73,22 @@ re-authenticating it on each restart. Once the sidecar is healthy, the auth key 
 state volume.
 
 Set `ADJUTANT_UI_BASE_URL` in `.env` to the HTTPS `*.ts.net` URL shown by `tailscale serve status`
-so Discord status messages link directly to the matching inspected run.
+so Discord status messages link directly to the matching inspected run. Put that same exact FQDN,
+without a scheme or port, in `.env.mcp` as `ADJUTANT_MCP_TAILSCALE_HOSTNAME`; the MCP HTTP
+transport uses it for Host-header validation on the developer endpoint. Leave it empty when using
+the agent-only Serve configuration.
 
 ## 3. Build and authenticate Codex
 
 ```sh
 docker compose build
+docker compose up -d tailscale adjutant-mcp
+docker compose logs --tail=100 adjutant-mcp
 docker compose run --rm adjutant codex login --device-auth
 docker compose run --rm adjutant codex login status
 ```
 
-The `codex-home` named volume retains the login and Codex configuration across container updates.
+The `codex-home` named volume retains the login state across container updates.
 Codex supports ChatGPT subscription login, and its documented headless flow is
 `codex login --device-auth`. OpenAI recommends API keys as the default for automation; this setup
 deliberately uses ChatGPT-managed authentication on a private, trusted runner to match Adjutant's
@@ -88,7 +100,9 @@ command.
 
 The `-p`/`--profile` option selects a Codex configuration profile; it is not a prompt option.
 Adjutant supplies the prompt over stdin to `codex exec -`. The CLI's JSONL mode is what powers the
-run inspector.
+run inspector. Compose mounts [`config/codex.toml`](../config/codex.toml) read-only into the Codex
+home, so the bundled database MCP and its tool allowlist are deployed as reviewed configuration;
+the named volume still owns the private login state.
 
 References: [Codex authentication](https://developers.openai.com/codex/auth),
 [non-interactive mode](https://developers.openai.com/codex/noninteractive), and
@@ -96,9 +110,10 @@ References: [Codex authentication](https://developers.openai.com/codex/auth),
 
 ## 4. Configure production tools
 
-Use the dedicated `codex-home` volume for a minimal `config.toml` and MCP registrations. Only add
-read-only Datadog, database, or internal telemetry tools. Mark mandatory MCPs as required so a
-diagnosis fails visibly instead of silently continuing without production evidence.
+The bundled database MCP is required and exposes only schema discovery plus bounded read-only
+queries. Add read-only Datadog or internal telemetry servers to the checked-in Codex configuration.
+Mark mandatory MCPs as required so a diagnosis fails visibly instead of silently continuing
+without production evidence.
 
 `CODEX_ENV_PASSTHROUGH` is the only path for extra environment variables into the Codex process.
 Adjutant rejects its Discord and UI secrets even if listed. Prefer short-lived or narrowly scoped
@@ -113,19 +128,25 @@ permission profile for this deployment.
 ```sh
 docker compose up -d
 docker compose ps
-docker compose logs -f tailscale adjutant
+docker compose logs -f tailscale adjutant-mcp adjutant
 docker compose exec tailscale tailscale serve status
 ```
 
-Use the HTTPS `*.ts.net` URL printed by Tailscale. The browser will request HTTP Basic credentials:
-the username is `adjutant`, and the password is `ADJUTANT_UI_TOKEN`. `/healthz` is the only
-unauthenticated endpoint. Keep a tailnet ACL around the sidecar even though the UI also requires the
-password.
+Use the HTTPS `*.ts.net` URL on port 443 printed by Tailscale. The browser will request HTTP Basic
+credentials: the username is `adjutant`, and the password is `ADJUTANT_UI_TOKEN`. `/healthz` is the
+only unauthenticated endpoint. Keep a tailnet ACL around the sidecar even though the UI also
+requires the password.
 
 The checked-in Serve configuration explicitly disables Funnel. The inspector binds only to the
 loopback interface shared with the sidecar, so port 8080 is unavailable from both the host and the
 Tailnet. Do not add a published port, enable Funnel, or put the inspector behind a public reverse
 proxy.
+
+The same hostname exposes the MCP to approved Tailnet developers at
+`https://<hostname>.<tailnet>.ts.net:8443/mcp`. It has no second bearer token: Tailnet identity and
+ACLs are the authorization layer, and the curated database views are the data boundary. Funnel is
+disabled on both ports. To keep MCP access local to Adjutant, set
+`TAILSCALE_SERVE_CONFIG=serve-agent-only.json` in `.env` and recreate the Tailscale service.
 
 ## Operations
 
@@ -136,9 +157,13 @@ proxy.
   `tailscale-state` if preserving the node identity matters. Extracted client bundles are not
   persisted.
 - Re-authenticate: rerun `docker compose run --rm adjutant codex login --device-auth`.
-- Network status: `docker compose exec tailscale tailscale status`; health for both containers is
+- Database MCP: inspect `docker compose logs adjutant-mcp`; `/healthz` checks that the dedicated
+  role can connect. Agent-initiated MCP calls and results also appear in the corresponding Codex
+  run's JSONL audit stream; service logs record bounded query metadata without database credentials.
+- Network status: `docker compose exec tailscale tailscale status`; health for all three services is
   visible in `docker compose ps`. Adjutant's health check covers both its UI and the sidecar's local
-  health endpoint. This verifies that the node has a Tailnet IP, not end-to-end ShieldBattery
+  health endpoints. This verifies that the node has a Tailnet IP and that the database login can
+  connect, not end-to-end ShieldBattery
   reachability; use a separate synthetic check if that path needs proactive alerting.
 - Retention: `RUN_RETENTION_DAYS` is applied at startup. Client logs and dumps live only in per-run
   temporary storage and are removed after the process finishes.

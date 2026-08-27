@@ -7,9 +7,10 @@ RUN cargo install minidump-stackwalk --version 0.27.0 --locked --root /opt/minid
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
 COPY migrations ./migrations
 COPY src ./src
-RUN cargo build --locked --release
+RUN cargo build --locked --release --workspace
 
 FROM node:24-bookworm-slim AS runtime
 
@@ -40,3 +41,17 @@ EXPOSE 8080
 # the non-root process from regaining them.
 ENTRYPOINT ["/usr/bin/setpriv", "--reuid=10001", "--regid=10001", "--init-groups", "--"]
 CMD ["/usr/local/bin/adjutant"]
+
+FROM debian:bookworm-slim AS mcp-runtime
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10002 adjutant-mcp \
+    && useradd --uid 10002 --gid adjutant-mcp --no-create-home --shell /usr/sbin/nologin adjutant-mcp
+
+COPY --from=builder /build/target/release/adjutant-mcp /usr/local/bin/adjutant-mcp
+
+USER 10002:10002
+EXPOSE 8081
+ENTRYPOINT ["/usr/local/bin/adjutant-mcp"]

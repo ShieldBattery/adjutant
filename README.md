@@ -6,10 +6,10 @@ private log bundle, asks Codex to correlate that evidence with the ShieldBattery
 read-only production tools, and posts the diagnosis in a staff-only output channel. Staff can also
 send one-off questions and attach ZIP files in the request channel.
 
-The bot is a Rust 2024 service packaged as a hardened Docker container. Each run is persisted to
-SQLite and can be inspected in a private, read-only web UI, including the evidence manifest, Codex
-JSONL events, tool calls, reasoning summaries, final report, and errors. Hidden chain-of-thought is
-not available from Codex and is not claimed to be captured.
+The repository is a Rust 2024 Cargo workspace containing the bot and a separate read-only database
+MCP. Each run is persisted to SQLite and can be inspected in a private, read-only web UI, including
+the evidence manifest, Codex JSONL events, tool calls, reasoning summaries, final report, and
+errors. Hidden chain-of-thought is not available from Codex and is not claimed to be captured.
 
 ## What is implemented
 
@@ -20,15 +20,18 @@ not available from Codex and is not claimed to be captured.
   count, and end-to-end runtime are bounded.
 - Discord and inspection-UI secrets never enter the Codex child environment.
 - Codex runs with `codex exec --ephemeral --json --sandbox read-only` against a read-only source
-  mount and optional read-only MCPs. Its model-generated commands have no network access, even
+  mount and approved read-only MCPs. Its model-generated commands have no network access, even
   though the parent service shares the sidecar's Tailnet connection.
 - A Tailscale sidecar gives the service private ShieldBattery egress and exposes the inspector with
   Tailnet-only HTTPS; no application port is published on the Docker host.
+- A credential-isolated Rust MCP gives Codex bounded read-only PostgreSQL queries. Compose deploys
+  it by default, and Tailscale Serve can also expose it privately to approved developers.
 - Results are posted inline when possible and attached as `diagnosis.md` when too long for Discord.
 - The container includes Mozilla's Rust `minidump-stackwalk` utility for Windows crash dumps.
 - Startup recovery marks interrupted runs failed, and old run history is pruned automatically.
 
-See [architecture](docs/architecture.md), the [deployment runbook](docs/deployment.md), and the
+See [architecture](docs/architecture.md), the [deployment runbook](docs/deployment.md), the
+[database MCP guide](docs/database-mcp.md), and the
 [ShieldBattery developer handoff](docs/shieldbattery-internal-api.md).
 
 ## Local verification
@@ -37,17 +40,18 @@ The current toolchain requirement is Rust 1.98 or newer.
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets
 ```
 
 ## Intended trust boundary
 
 Adjutant treats Discord text, uploaded files, log contents, and crash dumps as untrusted evidence.
 Codex runs with a read-only filesystem sandbox and no approval flow. The child process receives an
-explicit environment allowlist, and its dedicated Codex configuration must expose only read-only
-MCP tools. Evidence is size-limited, extracted without trusting ZIP paths, and removed with the
-per-job temporary directory.
+explicit environment allowlist, and its checked-in Codex configuration exposes only approved
+read-only MCP tools. Database credentials exist only in the MCP container and the database role can
+select only curated non-sensitive views. Evidence is size-limited, extracted without trusting ZIP
+paths, and removed with the per-job temporary directory.
 
 This is a diagnostic system, not a remediation system. It does not edit ShieldBattery, write to
 production data, or send messages anywhere except the configured Discord output channel.

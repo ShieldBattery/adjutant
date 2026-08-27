@@ -37,9 +37,11 @@ impl Config {
             bail!("ADJUTANT_MCP_DATABASE_URL must not be empty");
         }
 
-        let bind = required_or_default("ADJUTANT_MCP_BIND", "127.0.0.1:8081")
-            .parse()
-            .context("ADJUTANT_MCP_BIND must be a socket address")?;
+        let bind = validate_bind(
+            required_or_default("ADJUTANT_MCP_BIND", "127.0.0.1:8081")
+                .parse()
+                .context("ADJUTANT_MCP_BIND must be a socket address")?,
+        )?;
         let max_connections = parse_env("ADJUTANT_MCP_MAX_CONNECTIONS", 4_u32)?;
         let max_rows = parse_env("ADJUTANT_MCP_MAX_ROWS", Self::DEFAULT_MAX_ROWS)?;
         let max_response_bytes = parse_env(
@@ -158,6 +160,15 @@ fn required_or_default(name: &str, default: &str) -> String {
     env::var(name).unwrap_or_else(|_| default.to_owned())
 }
 
+fn validate_bind(bind: SocketAddr) -> Result<SocketAddr> {
+    if !bind.ip().is_loopback() {
+        bail!(
+            "ADJUTANT_MCP_BIND must use a loopback address; expose the service through Tailscale Serve"
+        );
+    }
+    Ok(bind)
+}
+
 fn parse_env<T>(name: &str, default: T) -> Result<T>
 where
     T: std::str::FromStr + Copy,
@@ -202,5 +213,12 @@ mod tests {
         let rendered = format!("{config:?}");
         assert!(rendered.contains("<redacted>"));
         assert!(!rendered.contains("secret"));
+    }
+
+    #[test]
+    fn mcp_listener_is_required_to_stay_on_loopback() {
+        assert!(super::validate_bind("127.0.0.1:8081".parse().unwrap()).is_ok());
+        assert!(super::validate_bind("[::1]:8081".parse().unwrap()).is_ok());
+        assert!(super::validate_bind("0.0.0.0:8081".parse().unwrap()).is_err());
     }
 }

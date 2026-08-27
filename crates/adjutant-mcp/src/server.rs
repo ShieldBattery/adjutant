@@ -3,7 +3,7 @@ use std::sync::Arc;
 use rmcp::{
     Json, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
+    model::{Implementation, ServerCapabilities, ServerInfo},
     schemars, tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
@@ -90,9 +90,15 @@ impl McpServer {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "This server is for ShieldBattery production diagnostics. Its database role and query validator are read-only. Discover the accessible schema first, request only the data needed for the investigation, and treat all returned user data as confidential.",
-        )
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(
+                Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+                    .with_title("Adjutant ShieldBattery diagnostics")
+                    .with_description("Bounded read-only access to curated ShieldBattery database views"),
+            )
+            .with_instructions(
+                "This server is for ShieldBattery production diagnostics. Its database role and query validator are read-only. Discover the accessible schema first, request only the data needed for the investigation, and treat all returned user data as confidential.",
+            )
     }
 }
 

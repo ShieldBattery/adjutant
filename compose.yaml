@@ -10,7 +10,7 @@ services:
       TS_AUTH_ONCE: "true"
       TS_ENABLE_HEALTH_CHECK: "true"
       TS_LOCAL_ADDR_PORT: 127.0.0.1:9002
-      TS_SERVE_CONFIG: /config/serve.json
+      TS_SERVE_CONFIG: /config/${TAILSCALE_SERVE_CONFIG:-serve.json}
       TS_SOCKET: /var/run/tailscale/tailscaled.sock
       TS_STATE_DIR: /var/lib/tailscale
       TS_USERSPACE: "false"
@@ -44,9 +44,46 @@ services:
       retries: 6
       start_period: 15s
 
+  adjutant-mcp:
+    build:
+      context: .
+      target: mcp-runtime
+    init: true
+    restart: unless-stopped
+    network_mode: service:tailscale
+    depends_on:
+      tailscale:
+        condition: service_healthy
+    env_file: .env.mcp
+    environment:
+      # Both Codex and Tailscale Serve reach the MCP over the shared loopback interface.
+      ADJUTANT_MCP_BIND: 127.0.0.1:8081
+    read_only: true
+    cap_drop:
+      - ALL
+    pids_limit: 64
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 35s
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - --fail
+        - --silent
+        - --show-error
+        - http://127.0.0.1:8081/healthz
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 10s
+
   adjutant:
     build:
       context: .
+      target: runtime
       args:
         CODEX_VERSION: 0.150.1
     init: true
@@ -54,6 +91,8 @@ services:
     network_mode: service:tailscale
     depends_on:
       tailscale:
+        condition: service_healthy
+      adjutant-mcp:
         condition: service_healthy
     env_file: .env
     environment:
@@ -65,6 +104,8 @@ services:
     volumes:
       - adjutant-data:/var/lib/adjutant/data
       - codex-home:/var/lib/adjutant/codex
+      # Keep tool policy reviewable in Git while auth.json remains in the private named volume.
+      - ./config/codex.toml:/var/lib/adjutant/codex/config.toml:ro
       - ../shieldbattery:/workspace/shieldbattery:ro
     read_only: true
     cap_drop:
@@ -84,7 +125,7 @@ services:
         - CMD
         - node
         - -e
-        - "Promise.all(['http://127.0.0.1:8080/healthz','http://127.0.0.1:9002/healthz'].map(u=>fetch(u).then(r=>{if(!r.ok)throw Error(r.status)}))).then(()=>process.exit(0)).catch(()=>process.exit(1))"
+        - "Promise.all(['http://127.0.0.1:8080/healthz','http://127.0.0.1:8081/healthz','http://127.0.0.1:9002/healthz'].map(u=>fetch(u).then(r=>{if(!r.ok)throw Error(r.status)}))).then(()=>process.exit(0)).catch(()=>process.exit(1))"
       interval: 30s
       timeout: 5s
       retries: 3

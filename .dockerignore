@@ -1,6 +1,7 @@
 .codex
 .env
 .env.tailscale
+.env.mcp
 .git
 .github
 data

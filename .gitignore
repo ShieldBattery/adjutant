@@ -1,6 +1,7 @@
 /target/
 /.env
 /.env.tailscale
+/.env.mcp
 /.idea/
 /.vscode/
 *.log
