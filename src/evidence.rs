@@ -188,7 +188,7 @@ impl EvidenceCollector {
         archive_budget: &mut ArchiveBudget,
     ) -> Result<(BugReport, Vec<ManifestEntry>)> {
         let client = self.shieldbattery.as_ref().context(
-            "automatic bug reports require SHIELDBATTERY_INTERNAL_URL; see docs/shieldbattery-internal-api.md",
+            "automatic bug reports require SHIELDBATTERY_INTERNAL_URL for the ShieldBattery internal API",
         )?;
         let report = client.get_report(report_id).await?;
         let metadata = serde_json::to_string_pretty(&report)?;

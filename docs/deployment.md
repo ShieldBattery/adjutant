@@ -54,11 +54,10 @@ hostname for your Datadog site in `datadog-mcp.env`. See the
 openssl rand -hex 32
 ```
 
-Leave `SHIELDBATTERY_INTERNAL_URL` empty until the internal API in
-[the developer handoff](shieldbattery-internal-api.md) has been implemented. One-off staff requests
-with Discord attachments work without it; automatic bug-report ZIP retrieval does not. Once the API
-exists, set it to the app server's directly Tailscale-reachable origin. Tailscale ACLs are the
-authorization boundary; there is no second application bearer token.
+Set `SHIELDBATTERY_INTERNAL_URL` to the app server's directly Tailscale-reachable origin to enable
+automatic bug-report metadata and ZIP retrieval. Leaving it empty disables automatic retrieval;
+one-off staff requests with Discord attachments still work. Tailscale ACLs are the authorization
+boundary, and there is no second application bearer token.
 
 In the Tailscale admin console, enable MagicDNS and HTTPS, then generate a pre-authorized auth key
 for this long-lived node and put it in `tailscale.env`. Prefer a tagged node such as

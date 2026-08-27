@@ -6,8 +6,8 @@ between untrusted reports, the Codex runner, production credentials, and product
 ## Project decisions
 
 - Treat `../shieldbattery` as a read-only reference. Do not change ShieldBattery from this repo
-  unless the operator explicitly reverses this decision. Describe required application-side work in
-  `docs/shieldbattery-internal-api.md` or another handoff document instead.
+  unless the operator explicitly reverses this decision. Describe any future application-side work
+  in a handoff document instead.
 - Tailscale is the application authorization boundary for ShieldBattery's internal report API and
   the developer-facing MCP endpoint. Do not reintroduce an internal API token or add an MCP bearer
   token without an explicit design change.

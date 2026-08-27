@@ -37,8 +37,7 @@ errors.
 
 See [architecture](docs/architecture.md), the [deployment runbook](docs/deployment.md), the
 [copyable VM bundle](deployment/README.md), the [database MCP guide](docs/database-mcp.md), the
-[Datadog MCP guide](docs/datadog-mcp.md), and the
-[ShieldBattery developer handoff](docs/shieldbattery-internal-api.md).
+[Datadog MCP guide](docs/datadog-mcp.md), and the deployment's tracked configuration examples.
 
 ## Local verification
 
