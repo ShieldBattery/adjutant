@@ -19,6 +19,16 @@ The Compose init shim runs as root, then the image entrypoint immediately drops 
 environment is protected by the non-dumpable setting. The entrypoint receives only `SETUID` and
 `SETGID` for this one-way handoff, and `no-new-privileges` prevents the service from regaining them.
 
+A separate Tailscale container owns the shared network namespace, resolver file, and `/dev/net/tun`.
+Adjutant gets Tailnet egress and MagicDNS through that namespace but does not receive the Tailscale
+auth key, state, LocalAPI socket, capabilities, or PID namespace. The inspector listens only on
+shared loopback; Tailscale Serve is the sole ingress path and terminates private HTTPS on port 443.
+The Codex child necessarily shares Adjutant's network namespace, but `--sandbox read-only` denies
+network access to every model-generated command. The Rust parent performs evidence downloads before
+starting Codex and exposes only the resulting local files to it. Do not replace this sandbox with a
+network-enabled permission profile: Tailscale authenticates at the node boundary, so doing so would
+also grant the agent direct access to every destination allowed to `tag:adjutant`.
+
 The long-running process owns a bounded queue. Gateway handlers only validate and enqueue work;
 they never download evidence or wait for Codex. A semaphore caps active diagnoses. Per-job
 temporary directories are removed after completion, so user logs and dumps do not become part of

@@ -20,7 +20,10 @@ not available from Codex and is not claimed to be captured.
   count, and end-to-end runtime are bounded.
 - Discord and inspection-UI secrets never enter the Codex child environment.
 - Codex runs with `codex exec --ephemeral --json --sandbox read-only` against a read-only source
-  mount and optional read-only MCPs.
+  mount and optional read-only MCPs. Its model-generated commands have no network access, even
+  though the parent service shares the sidecar's Tailnet connection.
+- A Tailscale sidecar gives the service private ShieldBattery egress and exposes the inspector with
+  Tailnet-only HTTPS; no application port is published on the Docker host.
 - Results are posted inline when possible and attached as `diagnosis.md` when too long for Discord.
 - The container includes Mozilla's Rust `minidump-stackwalk` utility for Windows crash dumps.
 - Startup recovery marks interrupted runs failed, and old run history is pruned automatically.

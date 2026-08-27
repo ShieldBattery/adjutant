@@ -1,8 +1,9 @@
 # Deployment runbook
 
-This runbook assumes Adjutant and ShieldBattery are sibling directories on a Linux VM and the VM is
-connected to the production tailnet. The Compose file publishes the UI only on host loopback;
-Tailscale Serve terminates HTTPS and makes it privately reachable.
+This runbook assumes Adjutant and ShieldBattery are sibling directories on a Linux VM. Tailscale
+runs inside the Compose stack: its sidecar provides private ShieldBattery connectivity and exposes
+the inspector through Tailnet-only HTTPS. No Tailscale host installation or published application
+port is required. The host must provide Docker access to `/dev/net/tun`.
 
 ## 1. Create the Discord application
 
@@ -26,7 +27,8 @@ private channel ACL is the authorization boundary.
 
 ```sh
 cp .env.example .env
-chmod 600 .env
+cp .env.tailscale.example .env.tailscale
+chmod 600 .env .env.tailscale
 ```
 
 Fill in the Discord token, guild/channel IDs, exact bug-report webhook ID, public ShieldBattery
@@ -42,8 +44,29 @@ with Discord attachments work without it; automatic bug-report ZIP retrieval doe
 exists, set it to the app server's directly Tailscale-reachable origin. Tailscale ACLs are the
 authorization boundary; there is no second application bearer token.
 
-Set `ADJUTANT_UI_BASE_URL` to the HTTPS URL produced by Tailscale Serve so Discord status messages
-link directly to the matching inspected run.
+In the Tailscale admin console, enable MagicDNS and HTTPS, then generate a pre-authorized auth key
+for this long-lived node and put it in `.env.tailscale`. Prefer a tagged node such as
+`tag:adjutant`; define its tag owner first and put `--advertise-tags=tag:adjutant` in
+`TS_EXTRA_ARGS`. Tailnet policy should allow staff to reach this node on port 443 and allow this node
+to reach only ShieldBattery's private app-server port and any explicitly required MCP endpoints.
+
+Bring up the sidecar first:
+
+```sh
+test -c /dev/net/tun
+docker compose up -d tailscale
+docker compose logs --tail=100 tailscale
+docker compose exec tailscale tailscale status
+docker compose exec tailscale tailscale serve status
+```
+
+The named `tailscale-state` volume preserves the node identity, and `TS_AUTH_ONCE=true` avoids
+re-authenticating it on each restart. Once the sidecar is healthy, the auth key can be removed from
+`.env.tailscale`; retain it only if you want automatic recovery after deliberately deleting the
+state volume.
+
+Set `ADJUTANT_UI_BASE_URL` in `.env` to the HTTPS `*.ts.net` URL shown by `tailscale serve status`
+so Discord status messages link directly to the matching inspected run.
 
 ## 3. Build and authenticate Codex
 
@@ -80,35 +103,43 @@ diagnosis fails visibly instead of silently continuing without production eviden
 `CODEX_ENV_PASSTHROUGH` is the only path for extra environment variables into the Codex process.
 Adjutant rejects its Discord and UI secrets even if listed. Prefer short-lived or narrowly scoped
 MCP credentials, and do not give the agent a database principal capable of writes. The source tree
-is mounted read-only and Codex itself is always invoked with the read-only sandbox.
+is mounted read-only and Codex itself is always invoked with the read-only sandbox. That sandbox
+also denies networking to model-generated commands, which is a required boundary because the parent
+container shares the sidecar's Tailnet connection. Do not configure a custom network-enabled Codex
+permission profile for this deployment.
 
 ## 5. Start and privately expose the UI
 
 ```sh
 docker compose up -d
 docker compose ps
-docker compose logs -f adjutant
-tailscale serve --bg http://127.0.0.1:8080
-tailscale serve status
+docker compose logs -f tailscale adjutant
+docker compose exec tailscale tailscale serve status
 ```
 
 Use the HTTPS `*.ts.net` URL printed by Tailscale. The browser will request HTTP Basic credentials:
 the username is `adjutant`, and the password is `ADJUTANT_UI_TOKEN`. `/healthz` is the only
-unauthenticated endpoint. Keep a tailnet ACL around the VM even though the UI also requires the
+unauthenticated endpoint. Keep a tailnet ACL around the sidecar even though the UI also requires the
 password.
 
-Tailscale Serve is private to the tailnet and terminates HTTPS. Do not use Tailscale Funnel, publish
-container port 8080 on a public interface, or put the inspector behind a public reverse proxy.
+The checked-in Serve configuration explicitly disables Funnel. The inspector binds only to the
+loopback interface shared with the sidecar, so port 8080 is unavailable from both the host and the
+Tailnet. Do not add a published port, enable Funnel, or put the inspector behind a public reverse
+proxy.
 
 ## Operations
 
-- Upgrade: pull, review the pinned Codex/minidump versions, then run
+- Upgrade: pull, review the pinned Tailscale/Codex/minidump versions, then run
   `docker compose build --pull && docker compose up -d`.
 - Stop: `docker compose down`. Compose gives active jobs up to 35 minutes to drain.
-- Back up: snapshot the `adjutant-data` volume; it contains requests, manifests, event JSONL, and
-  final reports, but not extracted client log bundles.
+- Back up: snapshot `adjutant-data` for requests, manifests, event JSONL, and final reports. Back up
+  `tailscale-state` if preserving the node identity matters. Extracted client bundles are not
+  persisted.
 - Re-authenticate: rerun `docker compose run --rm adjutant codex login --device-auth`.
-- Health: `curl http://127.0.0.1:8080/healthz` on the host or inspect Compose health status.
+- Network status: `docker compose exec tailscale tailscale status`; health for both containers is
+  visible in `docker compose ps`. Adjutant's health check covers both its UI and the sidecar's local
+  health endpoint. This verifies that the node has a Tailnet IP, not end-to-end ShieldBattery
+  reachability; use a separate synthetic check if that path needs proactive alerting.
 - Retention: `RUN_RETENTION_DAYS` is applied at startup. Client logs and dumps live only in per-run
   temporary storage and are removed after the process finishes.
 - Limits: if `JOB_TIMEOUT_SECONDS` is raised above 1800, raise Compose's `stop_grace_period` by at

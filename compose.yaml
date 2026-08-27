@@ -1,4 +1,49 @@
 services:
+  tailscale:
+    image: tailscale/tailscale:v1.102.3
+    restart: unless-stopped
+    env_file:
+      - path: .env.tailscale
+        required: false
+    environment:
+      TS_ACCEPT_DNS: "true"
+      TS_AUTH_ONCE: "true"
+      TS_ENABLE_HEALTH_CHECK: "true"
+      TS_LOCAL_ADDR_PORT: 127.0.0.1:9002
+      TS_SERVE_CONFIG: /config/serve.json
+      TS_SOCKET: /var/run/tailscale/tailscaled.sock
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_USERSPACE: "false"
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      # TS_SERVE_CONFIG watches its containing directory for changes.
+      - ./tailscale:/config:ro
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    pids_limit: 128
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+      - /var/run/tailscale:rw,noexec,nosuid,size=4m
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - --quiet
+        - --spider
+        - http://127.0.0.1:9002/healthz
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
+
   adjutant:
     build:
       context: .
@@ -6,14 +51,17 @@ services:
         CODEX_VERSION: 0.150.1
     init: true
     restart: unless-stopped
+    network_mode: service:tailscale
+    depends_on:
+      tailscale:
+        condition: service_healthy
     env_file: .env
     environment:
       ADJUTANT_DATABASE_PATH: /var/lib/adjutant/data/adjutant.sqlite3
-      ADJUTANT_UI_BIND: 0.0.0.0:8080
+      # Serve reaches this over the shared loopback interface; port 8080 is not exposed directly.
+      ADJUTANT_UI_BIND: 127.0.0.1:8080
       CODEX_HOME: /var/lib/adjutant/codex
       SHIELDBATTERY_SOURCE_DIR: /workspace/shieldbattery
-    ports:
-      - "127.0.0.1:8080:8080"
     volumes:
       - adjutant-data:/var/lib/adjutant/data
       - codex-home:/var/lib/adjutant/codex
@@ -36,7 +84,7 @@ services:
         - CMD
         - node
         - -e
-        - "fetch('http://127.0.0.1:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        - "Promise.all(['http://127.0.0.1:8080/healthz','http://127.0.0.1:9002/healthz'].map(u=>fetch(u).then(r=>{if(!r.ok)throw Error(r.status)}))).then(()=>process.exit(0)).catch(()=>process.exit(1))"
       interval: 30s
       timeout: 5s
       retries: 3
@@ -45,3 +93,4 @@ services:
 volumes:
   adjutant-data:
   codex-home:
+  tailscale-state:

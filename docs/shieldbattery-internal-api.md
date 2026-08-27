@@ -43,7 +43,8 @@ placement and ACLs:
 
 - Reject any request containing `X-Forwarded-For`, matching the existing `/metrics` convention so
   requests arriving through public nginx cannot reach the handler.
-- Restrict the app-server port with Tailscale ACLs so only the Adjutant VM can reach it.
+- Restrict the app-server port with Tailscale ACLs so only Adjutant's sidecar node (preferably
+  `tag:adjutant`) can reach it.
 
 The app-server listener must not be directly reachable from the public internet. Keep the public
 firewall limited to nginx, and expose the direct app port only on the Docker/private/Tailscale path.

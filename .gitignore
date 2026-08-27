@@ -1,6 +1,6 @@
 /target/
 /.env
+/.env.tailscale
 /.idea/
 /.vscode/
 *.log
-
