@@ -8,17 +8,24 @@ description = "A Discord-attached diagnostic agent for ShieldBattery"
 
 [dependencies]
 anyhow = "1.0.104"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 dotenvy = "0.15.7"
 futures-util = "0.3.34"
 reqwest = { version = "0.13.4", default-features = false, features = ["http2", "json", "rustls", "stream"] }
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 serenity = { version = "0.12.5", default-features = false, features = ["client", "gateway", "model", "rustls_backend"] }
+sha2 = "0.11.0"
+sqlx = { version = "0.9.0", default-features = false, features = ["macros", "migrate", "runtime-tokio", "sqlite-bundled"] }
+subtle = "2.6.1"
 tempfile = "3.27.0"
-tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+time = { version = "0.3.55", features = ["formatting"] }
+tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 url = "2.5.8"
-uuid = "1.26.0"
+uuid = { version = "1.26.0", features = ["v7"] }
 zip = { version = "8.1.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [profile.release]
@@ -31,4 +38,4 @@ unsafe_code = "forbid"
 [lints.clippy]
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
-
+missing_errors_doc = "allow"
