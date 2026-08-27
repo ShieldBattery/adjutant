@@ -1,0 +1,49 @@
+services:
+  adjutant:
+    build:
+      context: .
+      args:
+        CODEX_VERSION: 0.150.1
+    init: true
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      ADJUTANT_DATABASE_PATH: /var/lib/adjutant/data/adjutant.sqlite3
+      ADJUTANT_UI_BIND: 0.0.0.0:8080
+      CODEX_HOME: /var/lib/adjutant/codex
+      SHIELDBATTERY_SOURCE_DIR: /workspace/shieldbattery
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - adjutant-data:/var/lib/adjutant/data
+      - codex-home:/var/lib/adjutant/codex
+      - ../shieldbattery:/workspace/shieldbattery:ro
+    read_only: true
+    cap_drop:
+      - ALL
+    # Needed only by the setpriv entrypoint to drop from the root init shim to UID/GID 10001.
+    cap_add:
+      - SETGID
+      - SETUID
+    cpus: 2.0
+    mem_limit: 2g
+    pids_limit: 256
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=1g
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 35m
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  adjutant-data:
+  codex-home:

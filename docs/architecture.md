@@ -6,14 +6,29 @@ Adjutant has three trust zones:
 2. The orchestrator downloads and unpacks evidence under hard resource limits, stores an audit
    record, and starts Codex without passing service secrets into the child environment.
 3. Codex gets read-only source/evidence access plus a dedicated configuration containing only
-   read-only production MCPs. Its JSONL event stream and final answer are persisted before the
-   answer is delivered back to Discord.
+read-only production MCPs. Its JSONL event stream and final answer are persisted before the
+answer is delivered back to Discord.
+
+On Linux, Adjutant marks its own process non-dumpable before reading configuration. Combined
+with the cleared/allowlisted child environment and dropped container capabilities, this prevents a
+same-UID Codex shell command from recovering the bot's original secrets through `/proc`. Codex is
+placed in its own process group so timeout/cancellation also kills descendant commands.
+
+The Compose init shim runs as root, then the image entrypoint immediately drops Adjutant to UID/GID
+10001. This makes the init shim's inherited environment unreadable to Codex; Adjutant's own
+environment is protected by the non-dumpable setting. The entrypoint receives only `SETUID` and
+`SETGID` for this one-way handoff, and `no-new-privileges` prevents the service from regaining them.
 
 The long-running process owns a bounded queue. Gateway handlers only validate and enqueue work;
 they never download evidence or wait for Codex. A semaphore caps active diagnoses. Per-job
 temporary directories are removed after completion, so user logs and dumps do not become part of
 the persistent UI history. The database retains the request, evidence manifest, Codex event stream,
 final report, and errors for the configured retention period.
+
+The event stream has per-line, per-run byte, and per-run count limits. When one is reached,
+Adjutant drains the remaining child output to avoid deadlock but persists one explicit
+`adjutant.events_truncated` marker. Queue shutdown fails work that has not started and allows only
+already-running jobs to finish under the end-to-end deadline.
 
 ## Data flow
 
@@ -49,4 +64,3 @@ Adjutant intentionally does not prescribe a broad database password or Datadog A
 Codex child. Configure a dedicated `CODEX_HOME` with read-only MCP tools and narrowly scoped service
 credentials. `CODEX_ENV_PASSTHROUGH` is an explicit allowlist; Adjutant rejects attempts to pass its
 Discord, ShieldBattery, or UI credentials into Codex.
-

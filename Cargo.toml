@@ -28,6 +28,9 @@ url = "2.5.8"
 uuid = { version = "1.26.0", features = ["serde", "v7"] }
 zip = { version = "8.1.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.4", features = ["process"] }
+
 [profile.release]
 lto = "thin"
 strip = true

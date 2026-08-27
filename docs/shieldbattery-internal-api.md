@@ -46,6 +46,12 @@ Use both controls:
   `Authorization: Bearer <token>` using a constant-time comparison. Tailscale ACLs should restrict
   the Adjutant VM to app-server port 80 as well.
 
+The app-server listener must not be directly reachable from the public internet. Keep the public
+firewall limited to nginx, and expose the direct app port only on the Docker/private/Tailscale path.
+The absence of `X-Forwarded-For` is a defense-in-depth signal, not an adequate network boundary by
+itself. If that listener cannot be made private, use a separate tailnet-only listener or mTLS peer
+authentication for these routes.
+
 Pass `SB_INTERNAL_API_TOKEN` only to the Node app-server container. Do not log the Authorization
 header. Set `Cache-Control: private, no-store` and `X-Content-Type-Options: nosniff` on successful
 responses.
@@ -73,4 +79,3 @@ Adjutant configuration maps directly to this contract:
 SHIELDBATTERY_INTERNAL_URL=http://sb-prod
 SHIELDBATTERY_INTERNAL_TOKEN=<same high-entropy value>
 ```
-

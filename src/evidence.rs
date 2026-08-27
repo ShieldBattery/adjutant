@@ -50,6 +50,49 @@ struct ManifestEntry {
     source: String,
 }
 
+struct ExtractedArchive {
+    files: Vec<(String, u64)>,
+    entry_count: usize,
+    expanded_bytes: u64,
+}
+
+struct ArchiveBudget {
+    remaining_entries: usize,
+    remaining_bytes: u64,
+}
+
+impl ArchiveBudget {
+    const fn new(max_entries: usize, max_bytes: u64) -> Self {
+        Self {
+            remaining_entries: max_entries,
+            remaining_bytes: max_bytes,
+        }
+    }
+
+    async fn extract(
+        &mut self,
+        archive_path: PathBuf,
+        destination: PathBuf,
+    ) -> Result<Vec<(String, u64)>> {
+        let extracted = extract_zip(
+            archive_path,
+            destination,
+            self.remaining_entries,
+            self.remaining_bytes,
+        )
+        .await?;
+        self.remaining_entries = self
+            .remaining_entries
+            .checked_sub(extracted.entry_count)
+            .context("archive entry accounting underflow")?;
+        self.remaining_bytes = self
+            .remaining_bytes
+            .checked_sub(extracted.expanded_bytes)
+            .context("archive byte accounting underflow")?;
+        Ok(extracted.files)
+    }
+}
+
 #[derive(Clone)]
 pub struct EvidenceCollector {
     http: Client,
@@ -102,9 +145,13 @@ impl EvidenceCollector {
 
         let mut manifest = Vec::new();
         let mut report = None;
+        let mut archive_budget = ArchiveBudget::new(
+            self.config.max_archive_files,
+            self.config.max_expanded_bytes,
+        );
         if let Some(report_id) = request.bug_report_id {
             let (fetched, entries) = self
-                .collect_bug_report(report_id, &root, &evidence_dir)
+                .collect_bug_report(report_id, &root, &evidence_dir, &mut archive_budget)
                 .await?;
             manifest.extend(entries);
             report = Some(fetched);
@@ -112,8 +159,14 @@ impl EvidenceCollector {
 
         for (index, attachment) in request.attachments.iter().enumerate() {
             manifest.extend(
-                self.collect_attachment(index, attachment, &root, &evidence_dir)
-                    .await?,
+                self.collect_attachment(
+                    index,
+                    attachment,
+                    &root,
+                    &evidence_dir,
+                    &mut archive_budget,
+                )
+                .await?,
             );
         }
 
@@ -133,6 +186,7 @@ impl EvidenceCollector {
         report_id: Uuid,
         root: &Path,
         evidence_dir: &Path,
+        archive_budget: &mut ArchiveBudget,
     ) -> Result<(BugReport, Vec<ManifestEntry>)> {
         let client = self.shieldbattery.as_ref().context(
             "automatic bug reports require SHIELDBATTERY_INTERNAL_URL and SHIELDBATTERY_INTERNAL_TOKEN; see docs/shieldbattery-internal-api.md",
@@ -152,13 +206,9 @@ impl EvidenceCollector {
         let archive_path = root.join("bug-report.zip");
         self.download_response(client.get_logs(report_id).await?, &archive_path, None)
             .await?;
-        let entries = extract_zip(
-            archive_path.clone(),
-            evidence_dir.join("bug-report-logs"),
-            self.config.max_archive_files,
-            self.config.max_expanded_bytes,
-        )
-        .await?;
+        let entries = archive_budget
+            .extract(archive_path.clone(), evidence_dir.join("bug-report-logs"))
+            .await?;
         manifest.extend(entries.into_iter().map(|(path, bytes)| ManifestEntry {
             path: format!("bug-report-logs/{path}"),
             bytes,
@@ -174,6 +224,7 @@ impl EvidenceCollector {
         attachment: &Attachment,
         root: &Path,
         evidence_dir: &Path,
+        archive_budget: &mut ArchiveBudget,
     ) -> Result<Vec<ManifestEntry>> {
         validate_discord_attachment(attachment)?;
         if attachment.size > self.config.max_download_bytes {
@@ -222,13 +273,9 @@ impl EvidenceCollector {
         }
 
         let directory_name = filename.trim_end_matches(".zip");
-        let entries = extract_zip(
-            path.clone(),
-            evidence_dir.join(directory_name),
-            self.config.max_archive_files,
-            self.config.max_expanded_bytes,
-        )
-        .await?;
+        let entries = archive_budget
+            .extract(path.clone(), evidence_dir.join(directory_name))
+            .await?;
         tokio::fs::remove_file(path).await?;
         Ok(entries
             .into_iter()
@@ -321,7 +368,7 @@ async fn extract_zip(
     destination: PathBuf,
     max_files: usize,
     max_expanded_bytes: u64,
-) -> Result<Vec<(String, u64)>> {
+) -> Result<ExtractedArchive> {
     tokio::task::spawn_blocking(move || {
         extract_zip_blocking(&archive_path, &destination, max_files, max_expanded_bytes)
     })
@@ -334,7 +381,7 @@ fn extract_zip_blocking(
     destination: &Path,
     max_files: usize,
     max_expanded_bytes: u64,
-) -> Result<Vec<(String, u64)>> {
+) -> Result<ExtractedArchive> {
     let file = File::open(archive_path)?;
     let mut archive = ZipArchive::new(file).context("attachment is not a readable ZIP archive")?;
     if archive.len() > max_files {
@@ -395,7 +442,11 @@ fn extract_zip_blocking(
         total = total.saturating_add(copied);
         extracted.push((relative.to_string_lossy().replace('\\', "/"), copied));
     }
-    Ok(extracted)
+    Ok(ExtractedArchive {
+        files: extracted,
+        entry_count: archive.len(),
+        expanded_bytes: total,
+    })
 }
 
 #[cfg(test)]
@@ -450,6 +501,38 @@ mod tests {
 
         assert!(
             extract_zip_blocking(&archive_path, &directory.path().join("out"), 10, 64).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn enforces_archive_limits_across_all_job_attachments() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for index in 0..2 {
+            let archive_path = directory.path().join(format!("{index}.zip"));
+            let mut bytes = Cursor::new(Vec::new());
+            {
+                let mut writer = zip::ZipWriter::new(&mut bytes);
+                writer
+                    .start_file(format!("{index}.log"), SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(b"evidence").unwrap();
+                writer.finish().unwrap();
+            }
+            std::fs::write(&archive_path, bytes.into_inner()).unwrap();
+            paths.push(archive_path);
+        }
+
+        let mut budget = ArchiveBudget::new(1, 1024);
+        budget
+            .extract(paths[0].clone(), directory.path().join("out-0"))
+            .await
+            .unwrap();
+        assert!(
+            budget
+                .extract(paths[1].clone(), directory.path().join("out-1"))
+                .await
+                .is_err()
         );
     }
 }

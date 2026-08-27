@@ -14,6 +14,10 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    protect_process_secrets()?;
+    #[cfg(not(target_os = "linux"))]
+    protect_process_secrets();
     dotenvy::dotenv().ok();
     initialize_tracing();
 
@@ -30,9 +34,10 @@ async fn main() -> Result<()> {
 
     let collector = EvidenceCollector::new(Arc::clone(&config))?;
     let runner = CodexRunner::new(Arc::clone(&config), store.clone());
-    let (queue, job_handle) = jobs::start(
+    let (queue, job_shutdown, job_handle) = jobs::start(
         config.max_queued_jobs,
         config.max_concurrent_jobs,
+        config.job_timeout,
         store.clone(),
         collector,
         runner,
@@ -86,11 +91,12 @@ async fn main() -> Result<()> {
     };
 
     shard_manager.shutdown_all().await;
-    let _ = ui_shutdown_sender.send(());
     let discord_result = discord_handle.await.context("Discord task panicked")?;
-    let ui_result = ui_handle.await.context("inspection UI task panicked")?;
     drop(queue);
+    job_shutdown.shutdown();
     job_handle.await.context("job queue task panicked")?;
+    let _ = ui_shutdown_sender.send(());
+    let ui_result = ui_handle.await.context("inspection UI task panicked")?;
     store.close().await;
 
     if let Some(failure) = service_failure {
@@ -101,6 +107,16 @@ async fn main() -> Result<()> {
     info!("Adjutant stopped cleanly");
     Ok(())
 }
+
+#[cfg(target_os = "linux")]
+fn protect_process_secrets() -> Result<()> {
+    rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+        .context("failed to protect the Adjutant process environment")?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+const fn protect_process_secrets() {}
 
 fn initialize_tracing() {
     let filter = EnvFilter::try_from_default_env()

@@ -34,6 +34,8 @@ impl ShieldBatteryClient {
     pub fn new(base_url: Url, token: String) -> Result<Self> {
         let http = Client::builder()
             .redirect(Policy::none())
+            // Never put the private bearer credential onto a system-configured HTTP proxy.
+            .no_proxy()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(60))
             .user_agent(concat!("adjutant/", env!("CARGO_PKG_VERSION")))

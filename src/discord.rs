@@ -38,8 +38,9 @@ impl DiscordHandler {
         }
 
         let channel_id = message.channel_id.get();
-        let bug_alert =
-            channel_id == self.config.discord_bug_report_channel_id && message.webhook_id.is_some();
+        let bug_alert = channel_id == self.config.discord_bug_report_channel_id
+            && message.webhook_id.map(serenity::all::WebhookId::get)
+                == Some(self.config.discord_bug_report_webhook_id);
         let staff_request = channel_id == self.config.discord_request_channel_id
             && message.webhook_id.is_none()
             && !message.author.bot;
@@ -55,7 +56,8 @@ impl DiscordHandler {
             return Ok(());
         }
 
-        let bug_report_id = find_bug_report_id(&message.content);
+        let bug_report_id =
+            find_bug_report_id(&message.content, &self.config.shieldbattery_public_url);
         if bug_alert && bug_report_id.is_none() && message.attachments.is_empty() {
             warn!(
                 message_id = message.id.get(),
@@ -257,13 +259,26 @@ fn discord_attachments(message: &Message) -> Result<Vec<Attachment>> {
         .collect()
 }
 
-fn find_bug_report_id(content: &str) -> Option<Uuid> {
-    content
-        .match_indices(BUG_REPORT_PATH)
-        .find_map(|(index, _)| {
-            let suffix = &content[index + BUG_REPORT_PATH.len()..];
-            suffix.get(..36).and_then(|id| Uuid::parse_str(id).ok())
-        })
+fn find_bug_report_id(content: &str, public_url: &Url) -> Option<Uuid> {
+    let alert_url = content
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?
+        .trim_matches(['<', '>']);
+    let parsed = Url::parse(alert_url).ok()?;
+    if parsed.origin() != public_url.origin()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return None;
+    }
+    let id = parsed.path().strip_prefix(BUG_REPORT_PATH)?;
+    (id.len() == 36 && !id.contains('/'))
+        .then(|| Uuid::parse_str(id).ok())
+        .flatten()
 }
 
 fn title_for(kind: RunKind, bug_report_id: Option<Uuid>, content: &str) -> String {
@@ -305,17 +320,36 @@ mod tests {
     #[test]
     fn extracts_only_complete_bug_report_ids_after_admin_path() {
         let id = Uuid::parse_str("018e301c-3ca2-7524-9ce9-a76a1ee7a0bb").unwrap();
+        let public_url = Url::parse("https://shieldbattery.net").unwrap();
         assert_eq!(
-            find_bug_report_id(&format!(
-                "New report: https://shieldbattery.net/admin/bug-reports/{id}>"
-            )),
+            find_bug_report_id(
+                &format!("New report:\n<https://shieldbattery.net/admin/bug-reports/{id}>"),
+                &public_url
+            ),
             Some(id)
         );
+        assert_eq!(find_bug_report_id(&id.to_string(), &public_url), None);
         assert_eq!(
-            find_bug_report_id("018e301c-3ca2-7524-9ce9-a76a1ee7a0bb"),
+            find_bug_report_id(
+                "https://shieldbattery.net/admin/bug-reports/018e301c3ca275249ce9a76a1ee7a0bb",
+                &public_url
+            ),
             None
         );
-        assert_eq!(find_bug_report_id("/admin/bug-reports/not-a-uuid"), None);
+        assert_eq!(
+            find_bug_report_id(
+                &format!("https://evil.example/admin/bug-reports/{id}"),
+                &public_url
+            ),
+            None
+        );
+        assert_eq!(
+            find_bug_report_id(
+                &format!("https://shieldbattery.net/admin/bug-reports/{id}/extra"),
+                &public_url
+            ),
+            None
+        );
     }
 
     #[test]

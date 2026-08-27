@@ -1,10 +1,11 @@
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serenity::all::{
     ChannelId, CreateAllowedMentions, CreateAttachment, CreateMessage, EditMessage, Http, MessageId,
 };
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{error, info, warn};
 use url::Url;
@@ -37,6 +38,10 @@ pub struct JobQueue {
     sender: mpsc::Sender<DiagnosticJob>,
 }
 
+pub struct JobShutdown {
+    sender: oneshot::Sender<()>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EnqueueError {
     Full,
@@ -61,22 +66,46 @@ impl JobQueue {
     }
 }
 
+impl JobShutdown {
+    pub fn shutdown(self) {
+        let _ = self.sender.send(());
+    }
+}
+
 #[must_use]
 pub fn start(
     max_queued_jobs: usize,
     max_concurrent_jobs: usize,
+    job_timeout: Duration,
     store: Store,
     collector: EvidenceCollector,
     runner: CodexRunner,
-) -> (JobQueue, JoinHandle<()>) {
+) -> (JobQueue, JobShutdown, JoinHandle<()>) {
     let (sender, receiver) = mpsc::channel(max_queued_jobs);
-    let handle = tokio::spawn(run(receiver, max_concurrent_jobs, store, collector, runner));
-    (JobQueue { sender }, handle)
+    let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+    let handle = tokio::spawn(run(
+        receiver,
+        shutdown_receiver,
+        max_concurrent_jobs,
+        job_timeout,
+        store,
+        collector,
+        runner,
+    ));
+    (
+        JobQueue { sender },
+        JobShutdown {
+            sender: shutdown_sender,
+        },
+        handle,
+    )
 }
 
 async fn run(
     mut receiver: mpsc::Receiver<DiagnosticJob>,
+    mut shutdown: oneshot::Receiver<()>,
     max_concurrent_jobs: usize,
+    job_timeout: Duration,
     store: Store,
     collector: EvidenceCollector,
     runner: CodexRunner,
@@ -85,10 +114,27 @@ async fn run(
     let mut tasks = JoinSet::new();
 
     loop {
-        let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
+        let permit_result = tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                cancel_queued_jobs(&mut receiver, &store).await;
+                break;
+            }
+            result = Arc::clone(&permits).acquire_owned() => result,
+        };
+        let Ok(permit) = permit_result else {
             break;
         };
-        let Some(job) = receiver.recv().await else {
+        let job = tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                drop(permit);
+                cancel_queued_jobs(&mut receiver, &store).await;
+                break;
+            }
+            job = receiver.recv() => job,
+        };
+        let Some(job) = job else {
             drop(permit);
             break;
         };
@@ -97,7 +143,7 @@ async fn run(
         let job_runner = runner.clone();
         tasks.spawn(async move {
             let run_id = job.run_id;
-            process(job, &job_store, &job_collector, &job_runner).await;
+            process(job, &job_store, &job_collector, &job_runner, job_timeout).await;
             drop(permit);
             run_id
         });
@@ -118,11 +164,30 @@ async fn run(
     }
 }
 
+async fn cancel_queued_jobs(receiver: &mut mpsc::Receiver<DiagnosticJob>, store: &Store) {
+    receiver.close();
+    while let Some(job) = receiver.recv().await {
+        let run_id = job.run_id;
+        let reason = "Adjutant shut down before this queued run started";
+        if let Err(error) = store.fail_run(run_id, reason).await {
+            error!(%run_id, %error, "failed to mark a queued run as stopped");
+        }
+        update_status(
+            &job.delivery,
+            run_id,
+            "⏹️",
+            "Stopped before diagnosis started because Adjutant is shutting down.",
+        )
+        .await;
+    }
+}
+
 async fn process(
     job: DiagnosticJob,
     store: &Store,
     collector: &EvidenceCollector,
     runner: &CodexRunner,
+    job_timeout: Duration,
 ) {
     let run_id = job.run_id;
     info!(%run_id, title = %job.title, "starting diagnostic job");
@@ -138,14 +203,19 @@ async fn process(
     )
     .await;
 
-    let result = async {
+    let result = tokio::time::timeout(job_timeout, async {
         let workspace = collector.collect(run_id, &job.request).await?;
         store
             .set_evidence_manifest(run_id, &workspace.manifest_json)
             .await?;
         runner.run(run_id, &job.request.text, &workspace).await
-    }
-    .await;
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(anyhow::anyhow!(
+            "diagnostic run exceeded the {job_timeout:?} end-to-end timeout"
+        ))
+    });
 
     match result {
         Ok(report) => {
