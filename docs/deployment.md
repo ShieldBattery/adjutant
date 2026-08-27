@@ -37,15 +37,18 @@ the short update procedure.
 ```sh
 cp .env.example .env
 cp adjutant.env.example adjutant.env
+cp datadog-mcp.env.example datadog-mcp.env
 cp mcp.env.example mcp.env
 cp tailscale.env.example tailscale.env
-chmod 600 .env adjutant.env mcp.env tailscale.env
+chmod 600 .env adjutant.env datadog-mcp.env mcp.env tailscale.env
 ```
 
 Set the two GHCR image references and absolute ShieldBattery checkout path in `.env`. Fill in the
 Discord token, guild/channel IDs, exact bug-report webhook ID, public ShieldBattery origin, and a
 random UI password of at least 32 bytes in `adjutant.env`; put the dedicated read-only PostgreSQL
-URL in `mcp.env`. For example:
+URL in `mcp.env`. Put the dedicated read-only Datadog Service Access Token and the managed MCP
+hostname for your Datadog site in `datadog-mcp.env`. See the
+[Datadog MCP guide](datadog-mcp.md) for the exact role and token setup. For example:
 
 ```sh
 openssl rand -hex 32
@@ -62,7 +65,8 @@ for this long-lived node and put it in `tailscale.env`. Prefer a tagged node suc
 `tag:adjutant`; define its tag owner first and put `--advertise-tags=tag:adjutant` in
 `TS_EXTRA_ARGS`. Tailnet policy should allow staff to reach this node on port 443, allow only
 approved staff/developers to reach its database MCP on port 8443, and allow this node to reach only
-ShieldBattery's private app-server/database ports and any explicitly required MCP endpoints.
+ShieldBattery's private app-server/database ports. The VM's ordinary egress policy must also allow
+DNS and TCP 443 to the selected Datadog managed MCP hostname.
 
 Create the database role and curated views described in [the database MCP guide](database-mcp.md).
 The MCP container is the only service that receives `mcp.env`; Codex and the Discord bot never see
@@ -93,8 +97,9 @@ developer endpoint. Leave it empty when using the agent-only Serve configuration
 
 ```sh
 docker compose pull
-docker compose up -d tailscale adjutant-mcp
+docker compose up -d tailscale adjutant-mcp datadog-mcp-proxy
 docker compose logs --tail=100 adjutant-mcp
+docker compose logs --tail=100 datadog-mcp-proxy
 docker compose run --rm adjutant codex login --device-auth
 docker compose run --rm adjutant codex login status
 ```
@@ -130,16 +135,18 @@ References: [Codex authentication](https://developers.openai.com/codex/auth),
 
 ## 4. Configure production tools
 
-The bundled database MCP is required and exposes reviewed user/game diagnostic lookups, schema
-discovery, and bounded read-only queries. Add read-only Datadog or internal telemetry servers to
-the checked-in Codex configuration. Mark mandatory MCPs as required so a diagnosis fails visibly
-instead of silently continuing without production evidence.
+The bundled database and Datadog MCP connections are required. The former exposes reviewed
+user/game diagnostic lookups, schema discovery, and bounded read-only queries; the latter exposes a
+reviewed allowlist for logs, traces, metrics, events, monitors, and service relationships. The
+Datadog credential proxy fixes the managed upstream and `core` toolset while keeping its token out
+of Codex. Mark future mandatory MCPs as required so a diagnosis fails visibly instead of silently
+continuing without production evidence.
 
 `CODEX_ENV_PASSTHROUGH` is the only path for extra environment variables into the Codex process.
 Adjutant rejects its Discord and UI secrets even if listed. Prefer short-lived or narrowly scoped
-MCP credentials, and do not give the agent a database principal capable of writes. The source tree
-is mounted read-only and Codex itself is always invoked with the read-only sandbox. That sandbox
-also denies networking to model-generated commands, which is a required boundary because the parent
+MCP credentials, and do not give either production identity write access. The source tree is
+mounted read-only and Codex itself is always invoked with the read-only sandbox. That sandbox also
+denies networking to model-generated commands, which is a required boundary because the parent
 container shares the sidecar's Tailnet connection. Do not configure a custom network-enabled Codex
 permission profile for this deployment.
 
@@ -148,7 +155,7 @@ permission profile for this deployment.
 ```sh
 docker compose up -d
 docker compose ps
-docker compose logs -f tailscale adjutant-mcp adjutant
+docker compose logs -f tailscale adjutant-mcp datadog-mcp-proxy adjutant
 docker compose exec tailscale tailscale serve status
 ```
 
@@ -175,8 +182,11 @@ disabled on both ports. To keep MCP access local to Adjutant, set
   branch, semantic-version, and `sha-*` tags; use matching `sha-*` tags or image digests for a
   controlled deployment and rollback.
 - Upgrade deployment configuration: copy the new tracked contents of `deployment/` over the VM
-  directory without replacing `.env`, `adjutant.env`, `mcp.env`, or `tailscale.env`, then run the
-  same pull/up commands.
+  directory without replacing `.env`, `adjutant.env`, `datadog-mcp.env`, `mcp.env`, or
+  `tailscale.env`. Review changed `.example` files; if the update introduces a service env file that
+  is not already present, copy its example, restrict it to mode `600`, and fill in the required
+  values before running the same pull/up commands. In particular, deployments upgrading to the
+  Datadog MCP integration must create and fill `datadog-mcp.env` first.
 - Stop: `docker compose down`. Compose gives active jobs up to 35 minutes to drain.
 - Back up: snapshot `adjutant-data` for requests, manifests, event JSONL, and final reports. Back up
   `tailscale-state` if preserving the node identity matters. Extracted client bundles are not
@@ -185,11 +195,15 @@ disabled on both ports. To keep MCP access local to Adjutant, set
 - Database MCP: inspect `docker compose logs adjutant-mcp`; `/healthz` checks that the dedicated
   role can connect. Agent-initiated MCP calls and results also appear in the corresponding Codex
   run's JSONL audit stream; service logs record bounded query metadata without database credentials.
-- Network status: `docker compose exec tailscale tailscale status`; health for all three services is
-  visible in `docker compose ps`. Adjutant's health check covers both its UI and the sidecar's local
-  health endpoints. This verifies that the node has a Tailnet IP and that the database login can
-  connect, not end-to-end ShieldBattery
-  reachability; use a separate synthetic check if that path needs proactive alerting.
+- Datadog MCP: inspect `docker compose logs datadog-mcp-proxy`; its `/healthz` checks only that the
+  credential proxy is listening. Codex marks Datadog required and therefore fails a diagnosis
+  visibly if upstream initialization or authentication fails. Rotate its token using the procedure
+  in the [Datadog MCP guide](datadog-mcp.md).
+- Network status: `docker compose exec tailscale tailscale status`; service health is visible in
+  `docker compose ps`. Adjutant's health check covers its UI and all three sidecar health endpoints.
+  This verifies that the node has a Tailnet IP, the database login can connect, and the Datadog proxy
+  is listening—not end-to-end ShieldBattery or Datadog reachability. Use separate synthetic checks
+  if those paths need proactive alerting.
 - Retention: `RUN_RETENTION_DAYS` is applied at startup. Client logs and dumps live only in per-run
   temporary storage and are removed after the process finishes.
 - Limits: if `JOB_TIMEOUT_SECONDS` is raised above 1800, raise Compose's `stop_grace_period` by at

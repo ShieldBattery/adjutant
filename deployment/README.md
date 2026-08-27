@@ -16,14 +16,16 @@ and place a ShieldBattery checkout on the VM. From the copied directory:
 ```sh
 cp .env.example .env
 cp adjutant.env.example adjutant.env
+cp datadog-mcp.env.example datadog-mcp.env
 cp mcp.env.example mcp.env
 cp tailscale.env.example tailscale.env
-chmod 600 .env adjutant.env mcp.env tailscale.env
+chmod 600 .env adjutant.env datadog-mcp.env mcp.env tailscale.env
 ```
 
 Set the two `ghcr.io` image names and the absolute ShieldBattery checkout path in `.env`, then fill
-the three service env files. A missing ShieldBattery path fails startup rather than creating an
-empty directory.
+the four service env files. A missing ShieldBattery path fails startup rather than creating an
+empty directory. `datadog-mcp.env` contains the dedicated read-only Datadog service token and its
+site's managed MCP hostname.
 
 The repository workflow publishes `ghcr.io/<owner>/<repository>` and
 `ghcr.io/<owner>/<repository>-mcp`. GHCR initially creates packages as private; make both packages
@@ -44,7 +46,7 @@ test -d "$(sed -n 's/^SHIELDBATTERY_HOST_SOURCE_PATH=//p' .env)"
 docker compose config --quiet
 docker compose up -d tailscale
 docker compose logs --tail=100 tailscale
-docker compose up -d adjutant-mcp
+docker compose up -d adjutant-mcp datadog-mcp-proxy
 docker compose run --rm adjutant codex login --device-auth
 docker compose up -d
 docker compose ps
@@ -61,17 +63,22 @@ docker compose ps
 ```
 
 When deployment files also changed, copy the new contents over this directory without replacing
-`.env`, `adjutant.env`, `mcp.env`, or `tailscale.env`, then run the same update commands. For
-example, from a source checkout (review changed `.example` files for new settings afterward):
+`.env`, `adjutant.env`, `datadog-mcp.env`, `mcp.env`, or `tailscale.env`, then run the same update
+commands. For example, from a source checkout:
 
 ```sh
 rsync -av --delete \
   --exclude='.env' \
   --exclude='adjutant.env' \
+  --exclude='datadog-mcp.env' \
   --exclude='mcp.env' \
   --exclude='tailscale.env' \
   deployment/ <vm>:/opt/adjutant/
 ```
+
+Review changed `.example` files before updating. If an update introduces a service env file that
+does not exist on the VM—such as `datadog-mcp.env`—copy its example, restrict it to mode `600`, and
+fill in its required values before running `docker compose pull` or `docker compose up`.
 
 The workflow publishes `latest`, branch, semantic-version, and `sha-*` tags. For a controlled
 deployment or rollback, set both image values in `.env` to the same `sha-*` revision or to exact

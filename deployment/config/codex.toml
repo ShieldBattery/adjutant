@@ -17,3 +17,27 @@ enabled_tools = [
 default_tools_approval_mode = "writes"
 startup_timeout_sec = 10
 tool_timeout_sec = 15
+
+# Datadog hosts the remote MCP. This loopback-only proxy owns its service-access token and fixes the
+# upstream/toolset; Codex receives neither the token nor direct network access to Datadog.
+[mcp_servers.datadog]
+url = "http://127.0.0.1:8082/v1/mcp"
+enabled = true
+required = true
+enabled_tools = [
+  "search_datadog_logs",
+  "analyze_datadog_logs",
+  "search_datadog_spans",
+  "get_datadog_trace",
+  "search_datadog_metrics",
+  "get_datadog_metric",
+  "get_datadog_metric_context",
+  "search_datadog_events",
+  "search_datadog_monitors",
+  "search_datadog_hosts",
+  "search_datadog_services",
+  "search_datadog_service_dependencies",
+]
+default_tools_approval_mode = "writes"
+startup_timeout_sec = 15
+tool_timeout_sec = 60

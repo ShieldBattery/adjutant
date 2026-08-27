@@ -10,6 +10,10 @@ services:
     env_file: !override
       - mcp.env.example
 
+  datadog-mcp-proxy:
+    env_file: !override
+      - datadog-mcp.env.example
+
   adjutant:
     env_file: !override
       - adjutant.env.example

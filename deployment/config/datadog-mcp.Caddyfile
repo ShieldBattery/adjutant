@@ -1,0 +1,26 @@
+{
+	admin off
+	auto_https off
+	grace_period 15s
+	persist_config off
+}
+
+http://127.0.0.1:8082 {
+	route {
+		respond /healthz 200
+
+		# Keep the upstream and toolset fixed. Only the token and Datadog site hostname vary by
+		# deployment, and neither value is ever passed to the Adjutant or Codex process.
+		reverse_proxy /v1/mcp https://{$DATADOG_MCP_HOST} {
+			header_up Authorization "Bearer {env.DATADOG_MCP_ACCESS_TOKEN}"
+			header_up X-Datadog-MCP-Toolsets core
+			transport http {
+				dial_timeout 5s
+				tls_server_name {$DATADOG_MCP_HOST}
+				tls_timeout 10s
+			}
+		}
+
+		respond 404
+	}
+}

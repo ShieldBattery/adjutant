@@ -27,6 +27,8 @@ errors.
 - A credential-isolated Rust MCP gives Codex purpose-built user/game diagnostics plus bounded
   read-only PostgreSQL queries. Compose deploys it by default, and Tailscale Serve can also expose
   it privately to approved developers.
+- A loopback-only credential proxy connects Codex to Datadog's managed MCP with a dedicated
+  read-only service identity; neither Codex nor model-generated commands receive its token.
 - `deployment/` is a copyable, image-only VM bundle, and the GitHub Actions workflow publishes the
   bot and MCP Dockerfile targets as separate GHCR images.
 - Results are posted inline when possible and attached as `diagnosis.md` when too long for Discord.
@@ -34,7 +36,8 @@ errors.
 - Startup recovery marks interrupted runs failed, and old run history is pruned automatically.
 
 See [architecture](docs/architecture.md), the [deployment runbook](docs/deployment.md), the
-[copyable VM bundle](deployment/README.md), the [database MCP guide](docs/database-mcp.md), and the
+[copyable VM bundle](deployment/README.md), the [database MCP guide](docs/database-mcp.md), the
+[Datadog MCP guide](docs/datadog-mcp.md), and the
 [ShieldBattery developer handoff](docs/shieldbattery-internal-api.md).
 
 ## Local verification
@@ -53,8 +56,9 @@ Adjutant treats Discord text, uploaded files, log contents, and crash dumps as u
 Codex runs with a read-only filesystem sandbox and no approval flow. The child process receives an
 explicit environment allowlist, and its checked-in Codex configuration exposes only approved
 read-only MCP tools. Database credentials exist only in the MCP container and the database role can
-select only curated non-sensitive views. Evidence is size-limited, extracted without trusting ZIP
-paths, and removed with the per-job temporary directory.
+select only curated non-sensitive views. The Datadog service token exists only in its proxy sidecar,
+whose service account lacks write permissions. Evidence is size-limited, extracted without trusting
+ZIP paths, and removed with the per-job temporary directory.
 
 This is a diagnostic system, not a remediation system. It does not edit ShieldBattery, write to
 production data, or send messages anywhere except the configured Discord output channel.

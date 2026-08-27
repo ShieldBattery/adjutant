@@ -81,6 +81,44 @@ services:
       retries: 4
       start_period: 10s
 
+  datadog-mcp-proxy:
+    image: caddy:2.11.4-alpine
+    restart: unless-stopped
+    init: true
+    network_mode: service:tailscale
+    depends_on:
+      tailscale:
+        condition: service_healthy
+    env_file: datadog-mcp.env
+    volumes:
+      - ./config/datadog-mcp.Caddyfile:/etc/caddy/Caddyfile:ro
+    read_only: true
+    user: 10003:10003
+    cap_drop:
+      - ALL
+    # The official Caddy binary carries this file capability. Retaining only that capability lets
+    # the non-root process execute under no-new-privileges; the proxy itself binds high port 8082.
+    cap_add:
+      - NET_BIND_SERVICE
+    pids_limit: 64
+    tmpfs:
+      - /config:rw,noexec,nosuid,size=4m,uid=10003,gid=10003,mode=0700
+      - /data:rw,noexec,nosuid,size=4m,uid=10003,gid=10003,mode=0700
+      - /tmp:rw,noexec,nosuid,size=4m,uid=10003,gid=10003,mode=0700
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          test -n "$$DATADOG_MCP_HOST" &&
+          test -n "$$DATADOG_MCP_ACCESS_TOKEN" &&
+          wget --quiet --spider http://127.0.0.1:8082/healthz
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 5s
+
   adjutant:
     image: ${ADJUTANT_IMAGE:?ADJUTANT_IMAGE must be set in .env}
     pull_policy: always
@@ -91,6 +129,8 @@ services:
       tailscale:
         condition: service_healthy
       adjutant-mcp:
+        condition: service_healthy
+      datadog-mcp-proxy:
         condition: service_healthy
     env_file: adjutant.env
     environment:
@@ -129,7 +169,7 @@ services:
         - CMD
         - node
         - -e
-        - "Promise.all(['http://127.0.0.1:8080/healthz','http://127.0.0.1:8081/healthz','http://127.0.0.1:9002/healthz'].map(u=>fetch(u).then(r=>{if(!r.ok)throw Error(r.status)}))).then(()=>process.exit(0)).catch(()=>process.exit(1))"
+        - "Promise.all(['http://127.0.0.1:8080/healthz','http://127.0.0.1:8081/healthz','http://127.0.0.1:8082/healthz','http://127.0.0.1:9002/healthz'].map(u=>fetch(u).then(r=>{if(!r.ok)throw Error(r.status)}))).then(()=>process.exit(0)).catch(()=>process.exit(1))"
       interval: 30s
       timeout: 5s
       retries: 3

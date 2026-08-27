@@ -47,11 +47,12 @@ between untrusted reports, the Codex runner, production credentials, and product
   `deployment/compose.yaml`; local builds belong in the repository-only `compose.build.yaml`.
 - Keep the top-level Compose project name `adjutant` so moving the deployment directory does not
   orphan its persistent SQLite, Codex login, or Tailscale identity volumes.
-- Adjutant and the MCP use `network_mode: service:tailscale`; they intentionally share networking,
-  but not the Tailscale state volume, LocalAPI socket, auth key, capabilities, or PID namespace.
+- Adjutant, the database MCP, and the Datadog credential proxy use
+  `network_mode: service:tailscale`; they intentionally share networking, but not the Tailscale
+  state volume, LocalAPI socket, auth key, capabilities, or PID namespace.
 - Keep examples free of real guild/channel IDs, Tailnet names, hostnames, credentials, report data,
-  and database contents. Never commit deployment `.env`, `adjutant.env`, `mcp.env`,
-  `tailscale.env`, Codex auth state, or the runtime SQLite database.
+  and database contents. Never commit deployment `.env`, `adjutant.env`, `datadog-mcp.env`,
+  `mcp.env`, `tailscale.env`, Codex auth state, or the runtime SQLite database.
 
 ## Verification
 

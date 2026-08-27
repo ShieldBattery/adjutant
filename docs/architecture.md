@@ -8,8 +8,10 @@ Adjutant has four trust zones:
 3. Codex gets read-only source/evidence access plus a dedicated configuration containing only
    read-only production MCPs. Its JSONL event stream and final answer are persisted before the
    answer is delivered back to Discord.
-4. The database MCP is a separate process/container with the only copy of the production database
-   URL. It accepts bounded read-only requests, while PostgreSQL grants restrict it to curated views.
+4. Credential-isolated sidecars hold the production database URL and Datadog service token. The
+   database MCP accepts bounded read-only requests against curated views; the Datadog proxy is
+   configured to forward only to the selected Datadog managed MCP and authenticates as a read-only
+   service account.
 
 On Linux, Adjutant marks its own process non-dumpable before reading configuration. Combined
 with the cleared/allowlisted child environment and dropped container capabilities, this prevents a
@@ -22,17 +24,19 @@ environment is protected by the non-dumpable setting. The entrypoint receives on
 `SETGID` for this one-way handoff, and `no-new-privileges` prevents the service from regaining them.
 
 A separate Tailscale container owns the shared network namespace, resolver file, and `/dev/net/tun`.
-Adjutant and the MCP get Tailnet connectivity and MagicDNS through that namespace but do not receive
-the Tailscale auth key, state, LocalAPI socket, capabilities, or PID namespace. The inspector and MCP
-listen only on shared loopback; Tailscale Serve is the sole ingress path and terminates private
-HTTPS on ports 443 and 8443 respectively.
+Adjutant, the database MCP, and the Datadog proxy get Tailnet connectivity and MagicDNS through that
+namespace but do not receive the Tailscale auth key, state, LocalAPI socket, capabilities, or PID
+namespace. The inspector and database MCP listen only on shared loopback; Tailscale Serve is the
+sole ingress path and terminates private HTTPS on ports 443 and 8443 respectively. The Datadog proxy
+also listens on loopback but is deliberately absent from Tailscale Serve.
+
 The Codex child necessarily shares Adjutant's network namespace, but `--sandbox read-only` denies
-network access to every model-generated command. Codex reaches the database only through its
-explicitly configured MCP transport; it never receives the database URL. The Rust parent performs
-evidence downloads before starting Codex and exposes only the resulting local files to it. Do not
-replace this sandbox with a network-enabled permission profile: Tailscale authenticates at the
-node boundary, so doing so would also grant the agent direct access to every destination allowed
-to `tag:adjutant`.
+network access to every model-generated command. Codex reaches production data only through its
+explicitly configured MCP transports; it receives neither the database URL nor the Datadog token.
+The Rust parent performs evidence downloads before starting Codex and exposes only the resulting
+local files to it. Do not replace this sandbox with a network-enabled permission profile: Tailscale
+authenticates at the node boundary, so doing so would also grant the agent direct access to every
+destination allowed to `tag:adjutant`.
 
 The long-running process owns a bounded queue. Gateway handlers only validate and enqueue work;
 they never download evidence or wait for Codex. A semaphore caps active diagnoses. Per-job
@@ -59,6 +63,7 @@ Discord output <- final report <- Codex JSONL runner <-> SQLite -> inspection UI
                                        |
                                        +-> source tree
                                        +-> database MCP -> curated PostgreSQL views
+                                       +-> credential proxy -> Datadog managed MCP
 ```
 
 ## Inspectability
@@ -76,8 +81,9 @@ run data and is the only unauthenticated route.
 
 ## Production tool policy
 
-Adjutant never gives a database password or Datadog API key to the Codex child. The checked-in Codex
-configuration allowlists the isolated database MCP's five reviewed read-only tools; add other
-production MCPs with equally narrow policies and credentials owned by their sidecar or server.
+Adjutant never gives a database password or Datadog service token to the Codex child. The checked-in
+Codex configuration allowlists the isolated database MCP's five reviewed read-only tools and a
+reviewed subset of Datadog's read-only tools. Their credentials belong only to separate sidecars,
+and both production identities lack write privileges.
 `CODEX_ENV_PASSTHROUGH` is an explicit allowlist; Adjutant rejects attempts to pass its Discord or
 UI credentials into Codex.
