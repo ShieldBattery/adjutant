@@ -1,0 +1,25 @@
+# Repository-only overlay for building the two application images from source. Production uses
+# deployment/compose.yaml by itself and pulls the images configured in deployment/.env.
+services:
+  adjutant-mcp:
+    image: adjutant-mcp:local
+    pull_policy: build
+    build:
+      context: ..
+      target: mcp-runtime
+
+  adjutant:
+    image: adjutant:local
+    pull_policy: build
+    build:
+      context: ..
+      target: runtime
+      args:
+        CODEX_VERSION: 0.150.1
+    volumes:
+      - type: bind
+        source: ../../shieldbattery
+        target: /workspace/shieldbattery
+        read_only: true
+        bind:
+          create_host_path: false

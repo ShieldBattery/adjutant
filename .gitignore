@@ -2,6 +2,12 @@
 /.env
 /.env.tailscale
 /.env.mcp
+/deployment/.env
+/deployment/adjutant.env
+/deployment/mcp.env
+/deployment/tailscale.env
+/data/
+*.sqlite3*
 /.idea/
 /.vscode/
 *.log

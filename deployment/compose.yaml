@@ -1,9 +1,11 @@
+name: adjutant
+
 services:
   tailscale:
     image: tailscale/tailscale:v1.102.3
     restart: unless-stopped
     env_file:
-      - path: .env.tailscale
+      - path: tailscale.env
         required: false
     environment:
       TS_ACCEPT_DNS: "true"
@@ -45,16 +47,15 @@ services:
       start_period: 15s
 
   adjutant-mcp:
-    build:
-      context: .
-      target: mcp-runtime
+    image: ${ADJUTANT_MCP_IMAGE:?ADJUTANT_MCP_IMAGE must be set in .env}
+    pull_policy: always
     init: true
     restart: unless-stopped
     network_mode: service:tailscale
     depends_on:
       tailscale:
         condition: service_healthy
-    env_file: .env.mcp
+    env_file: mcp.env
     environment:
       # Both Codex and Tailscale Serve reach the MCP over the shared loopback interface.
       ADJUTANT_MCP_BIND: 127.0.0.1:8081
@@ -81,11 +82,8 @@ services:
       start_period: 10s
 
   adjutant:
-    build:
-      context: .
-      target: runtime
-      args:
-        CODEX_VERSION: 0.150.1
+    image: ${ADJUTANT_IMAGE:?ADJUTANT_IMAGE must be set in .env}
+    pull_policy: always
     init: true
     restart: unless-stopped
     network_mode: service:tailscale
@@ -94,7 +92,7 @@ services:
         condition: service_healthy
       adjutant-mcp:
         condition: service_healthy
-    env_file: .env
+    env_file: adjutant.env
     environment:
       ADJUTANT_DATABASE_PATH: /var/lib/adjutant/data/adjutant.sqlite3
       # Serve reaches this over the shared loopback interface; port 8080 is not exposed directly.
@@ -104,9 +102,15 @@ services:
     volumes:
       - adjutant-data:/var/lib/adjutant/data
       - codex-home:/var/lib/adjutant/codex
-      # Keep tool policy reviewable in Git while auth.json remains in the private named volume.
+      # Keep tool policy reviewable while auth.json remains in the private named volume.
       - ./config/codex.toml:/var/lib/adjutant/codex/config.toml:ro
-      - ../shieldbattery:/workspace/shieldbattery:ro
+      - type: bind
+        source: ${SHIELDBATTERY_HOST_SOURCE_PATH:?SHIELDBATTERY_HOST_SOURCE_PATH must be set in .env}
+        target: /workspace/shieldbattery
+        read_only: true
+        bind:
+          # A bad source path must fail instead of silently mounting an empty new directory.
+          create_host_path: false
     read_only: true
     cap_drop:
       - ALL

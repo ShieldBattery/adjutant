@@ -1,0 +1,15 @@
+# Repository-only overlay for validating Compose from a clean checkout. Production keeps the real
+# service env files required; this overlay substitutes tracked placeholders without creating local
+# secret files.
+services:
+  tailscale:
+    env_file: !override
+      - tailscale.env.example
+
+  adjutant-mcp:
+    env_file: !override
+      - mcp.env.example
+
+  adjutant:
+    env_file: !override
+      - adjutant.env.example

@@ -1,9 +1,13 @@
 # Deployment runbook
 
-This runbook assumes Adjutant and ShieldBattery are sibling directories on a Linux VM. Tailscale
-runs inside the Compose stack: its sidecar provides private ShieldBattery connectivity and exposes
-the inspector through Tailnet-only HTTPS. No Tailscale host installation or published application
-port is required. The host must provide Docker access to `/dev/net/tun`.
+The tracked `deployment/` directory is a self-contained runtime bundle: copy it to a Linux VM and
+pull the application images from GHCR. The Rust source and Dockerfile are not required on the VM,
+but a ShieldBattery checkout must exist at the absolute host path configured in `deployment/.env`.
+
+Tailscale runs inside the Compose stack: its sidecar provides private ShieldBattery connectivity
+and exposes the inspector through Tailnet-only HTTPS. No Tailscale host installation or published
+application port is required. The host must provide Docker access to `/dev/net/tun`. Run the
+commands below from the copied deployment directory (normally `/opt/adjutant`).
 
 ## 1. Create the Discord application
 
@@ -23,18 +27,25 @@ bug-report channel. It ignores bot/webhook traffic in the staff request channel.
 `DISCORD_ALLOWED_ROLE_IDS` is set, a staff request also needs one of those role IDs; otherwise the
 private channel ACL is the authorization boundary.
 
-## 2. Configure secrets and IDs
+## 2. Copy and configure the deployment bundle
+
+The GitHub workflow publishes the Dockerfile's `runtime` and `mcp-runtime` stages as
+`ghcr.io/<owner>/<repository>` and `ghcr.io/<owner>/<repository>-mcp`. Copy `deployment/` without
+any runtime env files; [its local README](../deployment/README.md) contains an `rsync` example and
+the short update procedure.
 
 ```sh
 cp .env.example .env
-cp .env.tailscale.example .env.tailscale
-cp .env.mcp.example .env.mcp
-chmod 600 .env .env.tailscale .env.mcp
+cp adjutant.env.example adjutant.env
+cp mcp.env.example mcp.env
+cp tailscale.env.example tailscale.env
+chmod 600 .env adjutant.env mcp.env tailscale.env
 ```
 
-Fill in the Discord token, guild/channel IDs, exact bug-report webhook ID, public ShieldBattery
-origin, a random UI password of at least 32 bytes, and the dedicated read-only PostgreSQL URL. For
-example:
+Set the two GHCR image references and absolute ShieldBattery checkout path in `.env`. Fill in the
+Discord token, guild/channel IDs, exact bug-report webhook ID, public ShieldBattery origin, and a
+random UI password of at least 32 bytes in `adjutant.env`; put the dedicated read-only PostgreSQL
+URL in `mcp.env`. For example:
 
 ```sh
 openssl rand -hex 32
@@ -47,14 +58,14 @@ exists, set it to the app server's directly Tailscale-reachable origin. Tailscal
 authorization boundary; there is no second application bearer token.
 
 In the Tailscale admin console, enable MagicDNS and HTTPS, then generate a pre-authorized auth key
-for this long-lived node and put it in `.env.tailscale`. Prefer a tagged node such as
+for this long-lived node and put it in `tailscale.env`. Prefer a tagged node such as
 `tag:adjutant`; define its tag owner first and put `--advertise-tags=tag:adjutant` in
 `TS_EXTRA_ARGS`. Tailnet policy should allow staff to reach this node on port 443, allow only
 approved staff/developers to reach its database MCP on port 8443, and allow this node to reach only
 ShieldBattery's private app-server/database ports and any explicitly required MCP endpoints.
 
 Create the database role and curated views described in [the database MCP guide](database-mcp.md).
-The MCP container is the only service that receives `.env.mcp`; Codex and the Discord bot never see
+The MCP container is the only service that receives `mcp.env`; Codex and the Discord bot never see
 the database password.
 
 Bring up the sidecar first:
@@ -69,26 +80,34 @@ docker compose exec tailscale tailscale serve status
 
 The named `tailscale-state` volume preserves the node identity, and `TS_AUTH_ONCE=true` avoids
 re-authenticating it on each restart. Once the sidecar is healthy, the auth key can be removed from
-`.env.tailscale`; retain it only if you want automatic recovery after deliberately deleting the
+`tailscale.env`; retain it only if you want automatic recovery after deliberately deleting the
 state volume.
 
-Set `ADJUTANT_UI_BASE_URL` in `.env` to the HTTPS `*.ts.net` URL shown by `tailscale serve status`
-so Discord status messages link directly to the matching inspected run. Put that same exact FQDN,
-without a scheme or port, in `.env.mcp` as `ADJUTANT_MCP_TAILSCALE_HOSTNAME`; the MCP HTTP
-transport uses it for Host-header validation on the developer endpoint. Leave it empty when using
-the agent-only Serve configuration.
+Set `ADJUTANT_UI_BASE_URL` in `adjutant.env` to the HTTPS `*.ts.net` URL shown by
+`tailscale serve status` so Discord status messages link directly to the matching inspected run.
+Put that same exact FQDN, without a scheme or port, in `mcp.env` as
+`ADJUTANT_MCP_TAILSCALE_HOSTNAME`; the MCP HTTP transport uses it for Host-header validation on the
+developer endpoint. Leave it empty when using the agent-only Serve configuration.
 
-## 3. Build and authenticate Codex
+## 3. Pull images and authenticate Codex
 
 ```sh
-docker compose build
+docker compose pull
 docker compose up -d tailscale adjutant-mcp
 docker compose logs --tail=100 adjutant-mcp
 docker compose run --rm adjutant codex login --device-auth
 docker compose run --rm adjutant codex login status
 ```
 
-The `codex-home` named volume retains the login state across container updates.
+GHCR initially creates packages as private. For private packages, run
+`docker login ghcr.io --username <github-user>` first with a classic deployment token that has only
+`read:packages`; packages made public in GitHub's package settings need no registry login. Keep
+this credential in Docker's credential store, not in the deployment env files.
+
+The `codex-home` named volume retains the login state across container updates. Compose's fixed
+project name is `adjutant`, so replacing or moving the bundle continues to use the same named
+volumes.
+
 Codex supports ChatGPT subscription login, and its documented headless flow is
 `codex login --device-auth`. OpenAI recommends API keys as the default for automation; this setup
 deliberately uses ChatGPT-managed authentication on a private, trusted runner to match Adjutant's
@@ -100,9 +119,10 @@ command.
 
 The `-p`/`--profile` option selects a Codex configuration profile; it is not a prompt option.
 Adjutant supplies the prompt over stdin to `codex exec -`. The CLI's JSONL mode is what powers the
-run inspector. Compose mounts [`config/codex.toml`](../config/codex.toml) read-only into the Codex
-home, so the bundled database MCP and its tool allowlist are deployed as reviewed configuration;
-the named volume still owns the private login state.
+run inspector. Compose mounts
+[`deployment/config/codex.toml`](../deployment/config/codex.toml) read-only into the Codex home, so
+the bundled database MCP and its tool allowlist are deployed as reviewed configuration; the named
+volume still owns the private login state.
 
 References: [Codex authentication](https://developers.openai.com/codex/auth),
 [non-interactive mode](https://developers.openai.com/codex/noninteractive), and
@@ -150,8 +170,13 @@ disabled on both ports. To keep MCP access local to Adjutant, set
 
 ## Operations
 
-- Upgrade: pull, review the pinned Tailscale/Codex/minidump versions, then run
-  `docker compose build --pull && docker compose up -d`.
+- Upgrade application images: run
+  `docker compose pull && docker compose up -d --remove-orphans`. The workflow publishes `latest`,
+  branch, semantic-version, and `sha-*` tags; use matching `sha-*` tags or image digests for a
+  controlled deployment and rollback.
+- Upgrade deployment configuration: copy the new tracked contents of `deployment/` over the VM
+  directory without replacing `.env`, `adjutant.env`, `mcp.env`, or `tailscale.env`, then run the
+  same pull/up commands.
 - Stop: `docker compose down`. Compose gives active jobs up to 35 minutes to drain.
 - Back up: snapshot `adjutant-data` for requests, manifests, event JSONL, and final reports. Back up
   `tailscale-state` if preserving the node identity matters. Extracted client bundles are not

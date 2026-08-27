@@ -26,12 +26,14 @@ errors. Hidden chain-of-thought is not available from Codex and is not claimed t
   Tailnet-only HTTPS; no application port is published on the Docker host.
 - A credential-isolated Rust MCP gives Codex bounded read-only PostgreSQL queries. Compose deploys
   it by default, and Tailscale Serve can also expose it privately to approved developers.
+- `deployment/` is a copyable, image-only VM bundle, and the GitHub Actions workflow publishes the
+  bot and MCP Dockerfile targets as separate GHCR images.
 - Results are posted inline when possible and attached as `diagnosis.md` when too long for Discord.
 - The container includes Mozilla's Rust `minidump-stackwalk` utility for Windows crash dumps.
 - Startup recovery marks interrupted runs failed, and old run history is pruned automatically.
 
 See [architecture](docs/architecture.md), the [deployment runbook](docs/deployment.md), the
-[database MCP guide](docs/database-mcp.md), and the
+[copyable VM bundle](deployment/README.md), the [database MCP guide](docs/database-mcp.md), and the
 [ShieldBattery developer handoff](docs/shieldbattery-internal-api.md).
 
 ## Local verification

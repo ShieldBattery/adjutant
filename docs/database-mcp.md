@@ -13,7 +13,8 @@ The normal Compose deployment also publishes this MCP to the Tailnet through Tai
 
 There is no Docker host port and Funnel is explicitly disabled. Tailscale ACL grants are the
 authorization boundary for port 8443. To keep the MCP agent-local, set
-`TAILSCALE_SERVE_CONFIG=serve-agent-only.json` in `.env` and restart the Tailscale service.
+`TAILSCALE_SERVE_CONFIG=serve-agent-only.json` in the copied deployment bundle's `.env` and restart
+the Tailscale service.
 
 ## Tools and bounds
 
@@ -112,16 +113,16 @@ should create and rotate the role independently.
 
 ## Adjutant configuration
 
-Copy `.env.mcp.example` to `.env.mcp`, put the dedicated role's URL in
+Copy `deployment/mcp.env.example` to `deployment/mcp.env`, put the dedicated role's URL in
 `ADJUTANT_MCP_DATABASE_URL`, and restrict the file to the deployment account. For Tailnet developer
 access, also set `ADJUTANT_MCP_TAILSCALE_HOSTNAME` to the exact `*.ts.net` FQDN reported by
 `tailscale serve status`; this is an allowlisted HTTP Host, not an additional credential. This file
 is loaded only by the MCP container; neither the Discord bot nor Codex receives it.
 
-The checked-in `config/codex.toml` makes this server required and allowlists only its two tools.
-Additional production MCPs, such as Datadog, should be added to that file with equally narrow tool
-and approval policies. Keep credentials in the Codex volume or environment references, never in
-Git.
+The checked-in `deployment/config/codex.toml` makes this server required and allowlists only its
+two tools. Additional production MCPs, such as Datadog, should be added to that file with equally
+narrow tool and approval policies. Keep credentials in the Codex volume or environment references,
+never in Git.
 
 For developer use, any Streamable HTTP MCP client can use the Tailnet HTTPS URL without a bearer
 token. Grant port 8443 only to the developer/staff identities that should be able to query the
