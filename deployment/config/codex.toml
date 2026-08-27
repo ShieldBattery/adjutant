@@ -5,7 +5,13 @@
 url = "http://127.0.0.1:8081/mcp"
 enabled = true
 required = true
-enabled_tools = ["database_schema", "query_database"]
+enabled_tools = [
+  "search_users",
+  "get_user_diagnostics",
+  "get_game_diagnostics",
+  "database_schema",
+  "query_database",
+]
 # Automatically use tools that retain their MCP read-only annotation; a future write-capable tool
 # will require approval and therefore fail closed in the unattended runner.
 default_tools_approval_mode = "writes"

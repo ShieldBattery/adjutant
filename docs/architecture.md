@@ -77,7 +77,7 @@ run data and is the only unauthenticated route.
 ## Production tool policy
 
 Adjutant never gives a database password or Datadog API key to the Codex child. The checked-in Codex
-configuration allowlists the isolated database MCP's two read-only tools; add other production MCPs
-with equally narrow policies and credentials owned by their sidecar or server.
+configuration allowlists the isolated database MCP's five reviewed read-only tools; add other
+production MCPs with equally narrow policies and credentials owned by their sidecar or server.
 `CODEX_ENV_PASSTHROUGH` is an explicit allowlist; Adjutant rejects attempts to pass its Discord or
 UI credentials into Codex.

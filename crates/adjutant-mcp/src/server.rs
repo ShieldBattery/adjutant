@@ -7,10 +7,14 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
+use uuid::Uuid;
 
 use crate::{
     Config,
-    database::{Database, QueryResult, SchemaResult},
+    database::{
+        Database, GameDiagnosticsResult, QueryResult, SchemaResult, UserDiagnosticsResult,
+        UserSearchResult,
+    },
 };
 
 /// Read-only MCP tool provider. It holds a database pool but never exposes its
@@ -38,6 +42,30 @@ struct QueryRequest {
     max_rows: Option<u32>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SearchUsersRequest {
+    /// Complete or initial characters of a `ShieldBattery` display name. Matching is case-insensitive.
+    query: String,
+    /// Maximum matches to return. Defaults to 10 and cannot exceed 20.
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct UserDiagnosticsRequest {
+    /// Exact `ShieldBattery` user ID. Supply this or `username`, but not both.
+    user_id: Option<i32>,
+    /// Exact case-insensitive `ShieldBattery` display name. Supply this or `user_id`, but not both.
+    username: Option<String>,
+    /// Number of recent games to include. Defaults to 10 and cannot exceed 20.
+    recent_games_limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct GameDiagnosticsRequest {
+    /// Exact `ShieldBattery` game UUID.
+    game_id: String,
+}
+
 impl McpServer {
     #[must_use]
     pub fn new(database: Arc<Database>, config: Config) -> Self {
@@ -51,6 +79,58 @@ impl McpServer {
 
 #[tool_router]
 impl McpServer {
+    #[tool(
+        description = "Find ShieldBattery users by case-insensitive exact or display-name prefix match. Returns only user ID, display name, and account creation time. Prefer this over raw SQL when resolving a reported username.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn search_users(
+        &self,
+        Parameters(request): Parameters<SearchUsersRequest>,
+    ) -> Result<Json<UserSearchResult>, String> {
+        self.database
+            .search_users(&request.query, request.limit, &self.config)
+            .await
+            .map(Json)
+            .map_err(|error| format!("user search failed: {error:#}"))
+    }
+
+    #[tool(
+        description = "Get a bounded diagnostic summary for one ShieldBattery user resolved by ID or exact display name. Returns only non-sensitive identity, aggregate game statistics, current matchmaking ratings, and recent games. Prefer this over raw SQL for user investigations.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn get_user_diagnostics(
+        &self,
+        Parameters(request): Parameters<UserDiagnosticsRequest>,
+    ) -> Result<Json<UserDiagnosticsResult>, String> {
+        self.database
+            .get_user_diagnostics(
+                request.user_id,
+                request.username.as_deref(),
+                request.recent_games_limit,
+                &self.config,
+            )
+            .await
+            .map(Json)
+            .map_err(|error| format!("user diagnostics failed: {error:#}"))
+    }
+
+    #[tool(
+        description = "Get the composed diagnostic record for one ShieldBattery game: core game and map data, participants and result reports, netcode-v2 placement and relay history, desync events, matchmaker formation inputs, and rating changes. Prefer this over raw SQL for game or network incident investigations.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn get_game_diagnostics(
+        &self,
+        Parameters(request): Parameters<GameDiagnosticsRequest>,
+    ) -> Result<Json<GameDiagnosticsResult>, String> {
+        let game_id = Uuid::parse_str(&request.game_id)
+            .map_err(|error| format!("game_id must be a UUID: {error}"))?;
+        self.database
+            .get_game_diagnostics(game_id, &self.config)
+            .await
+            .map(Json)
+            .map_err(|error| format!("game diagnostics failed: {error:#}"))
+    }
+
     #[tool(
         description = "List tables, views, and columns accessible to the dedicated read-only database role. Use this before querying unfamiliar data.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
@@ -97,7 +177,7 @@ impl ServerHandler for McpServer {
                     .with_description("Bounded read-only access to curated ShieldBattery database views"),
             )
             .with_instructions(
-                "This server is for ShieldBattery production diagnostics. Its database role and query validator are read-only. Discover the accessible schema first, request only the data needed for the investigation, and treat all returned user data as confidential.",
+                "This server is for ShieldBattery production diagnostics. Its database role and all tools are read-only. Prefer search_users, get_user_diagnostics, and get_game_diagnostics for their matching investigations. Use database_schema and query_database only for questions those stable tools do not answer. Request only the data needed and treat all returned user data as confidential.",
             )
     }
 }
@@ -108,9 +188,18 @@ mod tests {
 
     #[test]
     fn tool_definitions_advertise_read_only_annotations() {
+        let search_users = McpServer::search_users_tool_attr();
+        let user_diagnostics = McpServer::get_user_diagnostics_tool_attr();
+        let game_diagnostics = McpServer::get_game_diagnostics_tool_attr();
         let schema = McpServer::database_schema_tool_attr();
         let query = McpServer::query_database_tool_attr();
-        for tool in [schema, query] {
+        for tool in [
+            search_users,
+            user_diagnostics,
+            game_diagnostics,
+            schema,
+            query,
+        ] {
             let annotations = tool.annotations.expect("annotations should be present");
             assert_eq!(annotations.read_only_hint, Some(true));
             assert_eq!(annotations.idempotent_hint, Some(true));
@@ -119,14 +208,25 @@ mod tests {
     }
 
     #[test]
-    fn tool_router_has_both_database_tools() {
+    fn tool_router_has_all_database_tools() {
         let router = McpServer::tool_router();
         let names: Vec<_> = router
             .list_all()
             .into_iter()
             .map(|tool| tool.name)
             .collect();
-        assert!(names.iter().any(|name| name == "database_schema"));
-        assert!(names.iter().any(|name| name == "query_database"));
+        assert_eq!(names.len(), 5);
+        for expected in [
+            "search_users",
+            "get_user_diagnostics",
+            "get_game_diagnostics",
+            "database_schema",
+            "query_database",
+        ] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "missing {expected}"
+            );
+        }
     }
 }

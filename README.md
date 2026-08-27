@@ -24,8 +24,9 @@ errors.
   though the parent service shares the sidecar's Tailnet connection.
 - A Tailscale sidecar gives the service private ShieldBattery egress and exposes the inspector with
   Tailnet-only HTTPS; no application port is published on the Docker host.
-- A credential-isolated Rust MCP gives Codex bounded read-only PostgreSQL queries. Compose deploys
-  it by default, and Tailscale Serve can also expose it privately to approved developers.
+- A credential-isolated Rust MCP gives Codex purpose-built user/game diagnostics plus bounded
+  read-only PostgreSQL queries. Compose deploys it by default, and Tailscale Serve can also expose
+  it privately to approved developers.
 - `deployment/` is a copyable, image-only VM bundle, and the GitHub Actions workflow publishes the
   bot and MCP Dockerfile targets as separate GHCR images.
 - Results are posted inline when possible and attached as `diagnosis.md` when too long for Discord.

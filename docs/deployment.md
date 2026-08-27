@@ -130,10 +130,10 @@ References: [Codex authentication](https://developers.openai.com/codex/auth),
 
 ## 4. Configure production tools
 
-The bundled database MCP is required and exposes only schema discovery plus bounded read-only
-queries. Add read-only Datadog or internal telemetry servers to the checked-in Codex configuration.
-Mark mandatory MCPs as required so a diagnosis fails visibly instead of silently continuing
-without production evidence.
+The bundled database MCP is required and exposes reviewed user/game diagnostic lookups, schema
+discovery, and bounded read-only queries. Add read-only Datadog or internal telemetry servers to
+the checked-in Codex configuration. Mark mandatory MCPs as required so a diagnosis fails visibly
+instead of silently continuing without production evidence.
 
 `CODEX_ENV_PASSTHROUGH` is the only path for extra environment variables into the Codex process.
 Adjutant rejects its Discord and UI secrets even if listed. Prefer short-lived or narrowly scoped
