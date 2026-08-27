@@ -25,8 +25,6 @@ services:
     cap_add:
       - SETGID
       - SETUID
-    cpus: 2.0
-    mem_limit: 2g
     pids_limit: 256
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=1g
