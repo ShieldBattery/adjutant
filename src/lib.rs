@@ -1,2 +1,8 @@
+pub mod codex;
 pub mod config;
+pub mod discord;
+pub mod evidence;
+pub mod jobs;
+pub mod shieldbattery;
 pub mod store;
+pub mod web;

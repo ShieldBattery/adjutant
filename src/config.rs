@@ -38,6 +38,7 @@ pub struct Config {
     pub database_path: PathBuf,
     pub ui_bind: SocketAddr,
     pub ui_token: String,
+    pub ui_base_url: Option<Url>,
     pub run_retention_days: u64,
 }
 
@@ -110,6 +111,9 @@ impl Config {
                 .parse()
                 .context("ADJUTANT_UI_BIND must be an IP:port socket address")?,
             ui_token,
+            ui_base_url: optional("ADJUTANT_UI_BASE_URL")
+                .map(|value| parse_ui_url(&value))
+                .transpose()?,
             run_retention_days: parse_positive_or("RUN_RETENTION_DAYS", 90)?,
         })
     }
@@ -179,6 +183,24 @@ fn parse_internal_url(value: &str) -> Result<Url> {
         bail!("SHIELDBATTERY_INTERNAL_URL must not contain a path");
     }
     url.set_path("");
+    Ok(url)
+}
+
+fn parse_ui_url(value: &str) -> Result<Url> {
+    let mut url = Url::parse(value).context("ADJUTANT_UI_BASE_URL is not a valid URL")?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        bail!("ADJUTANT_UI_BASE_URL must be an HTTP(S) URL");
+    }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("ADJUTANT_UI_BASE_URL cannot contain credentials, a query, or a fragment");
+    }
+    if !url.path().ends_with('/') {
+        url.set_path(&format!("{}/", url.path()));
+    }
     Ok(url)
 }
 
