@@ -6,6 +6,10 @@ rust-version = "1.98"
 license = "MIT"
 description = "A Discord-attached diagnostic agent for ShieldBattery"
 
+[workspace]
+members = [".", "crates/adjutant-mcp"]
+resolver = "3"
+
 [dependencies]
 anyhow = "1.0.104"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
