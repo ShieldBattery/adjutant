@@ -64,9 +64,14 @@ The defaults retain source generations for two hours around 30-minute diagnoses.
 [source-sync guide](source-sync.md) for its snapshot contract and operations.
 
 Set `SHIELDBATTERY_INTERNAL_URL` to the app server's directly Tailscale-reachable origin to enable
-automatic bug-report metadata and ZIP retrieval. Leaving it empty disables automatic retrieval;
-one-off staff requests with Discord attachments still work. Tailscale ACLs are the authorization
-boundary, and there is no second application bearer token.
+automatic bug-report retrieval and game-artifact retrieval. A staff request containing a canonical
+ShieldBattery game link, a raw game UUID on its own line, or a raw UUID labeled `game`, `game-id`,
+`game_id`, or `gameId` attempts to download all retained flight recordings, replays, the map, and
+artifact metadata up to the configured limits. An artifact that disappears after listing becomes
+an explicit unavailable marker; other retrieval or validation failures fail the run. If the
+internal URL is empty, a request naming a bug report or game fails, while attachment-only requests
+still work. Tailscale ACLs are the authorization boundary, and there is no second application
+bearer token.
 
 In the Tailscale admin console, enable MagicDNS and HTTPS, then generate a pre-authorized auth key
 for this long-lived node and put it in `tailscale.env`. Prefer a tagged node such as
@@ -234,3 +239,5 @@ disabled on both ports. To keep MCP access local to Adjutant, set
   `stop_grace_period` by at least the same amount. The source size settings use GitHub's
   API-reported sizes as preflight guards; monitor or quota `source-repos` for a hard disk bound.
   Queued jobs are failed promptly on shutdown; only active jobs drain.
+  Game artifacts are fetched sequentially, and the end-to-end job timeout includes both evidence
+  collection and diagnosis; slow multi-artifact pulls can therefore consume diagnosis time.

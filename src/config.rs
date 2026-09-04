@@ -29,6 +29,9 @@ pub struct Config {
     pub max_concurrent_jobs: usize,
     pub max_queued_jobs: usize,
     pub max_download_bytes: u64,
+    pub max_game_artifacts: usize,
+    pub max_game_artifact_bytes: u64,
+    pub max_game_evidence_bytes: u64,
     pub max_archive_files: usize,
     pub max_expanded_bytes: u64,
     pub max_codex_events: usize,
@@ -63,6 +66,14 @@ impl Config {
             }
         }
 
+        let max_game_artifact_bytes =
+            parse_positive_or("MAX_GAME_ARTIFACT_BYTES", 100 * 1024 * 1024)?;
+        let max_game_evidence_bytes =
+            parse_positive_or("MAX_GAME_EVIDENCE_BYTES", 256 * 1024 * 1024)?;
+        if max_game_artifact_bytes > max_game_evidence_bytes {
+            bail!("MAX_GAME_ARTIFACT_BYTES cannot exceed MAX_GAME_EVIDENCE_BYTES");
+        }
+
         Ok(Self {
             discord_token: required("DISCORD_TOKEN")?,
             discord_guild_id: parse_required("DISCORD_GUILD_ID")?,
@@ -90,6 +101,9 @@ impl Config {
             max_concurrent_jobs: parse_positive_or("MAX_CONCURRENT_JOBS", 2)?,
             max_queued_jobs: parse_positive_or("MAX_QUEUED_JOBS", 20)?,
             max_download_bytes: parse_positive_or("MAX_DOWNLOAD_BYTES", 32 * 1024 * 1024)?,
+            max_game_artifacts: parse_positive_or("MAX_GAME_ARTIFACTS", 32)?,
+            max_game_artifact_bytes,
+            max_game_evidence_bytes,
             max_archive_files: parse_positive_or("MAX_ARCHIVE_FILES", 128)?,
             max_expanded_bytes: parse_positive_or("MAX_EXPANDED_BYTES", 256 * 1024 * 1024)?,
             max_codex_events: parse_positive_or("MAX_CODEX_EVENTS", 10_000)?,

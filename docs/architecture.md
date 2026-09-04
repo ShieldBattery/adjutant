@@ -63,11 +63,11 @@ already-running jobs to finish under the end-to-end deadline.
 ## Data flow
 
 ```text
-bug-report webhook --\
-                      +-> validate/filter -> bounded queue -> evidence workspace
-staff request + ZIP --/                                      |
-                                                             +-> ShieldBattery internal API
-                                                             +-> guarded ZIP extraction
+bug-report webhook --------\
+                            +-> validate/filter -> bounded queue -> evidence workspace
+staff request + evidence --/                                      |
+                                                                   +-> ShieldBattery internal API
+                                                                   +-> guarded ZIP extraction
                                                                       |
                                                                       v
 Discord output <- final report <- Codex JSONL runner <-> SQLite -> inspection UI

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serenity::all::{
     ChannelId, Context, CreateAllowedMentions, CreateMessage, EditMessage, EventHandler,
     GatewayIntents, Message, Ready,
@@ -58,6 +59,7 @@ impl DiscordHandler {
 
         let bug_report_id =
             find_bug_report_id(&message.content, &self.config.shieldbattery_public_url);
+        let game_id = find_game_id(&message.content, &self.config.shieldbattery_public_url);
         if bug_alert && bug_report_id.is_none() && message.attachments.is_empty() {
             warn!(
                 message_id = message.id.get(),
@@ -83,7 +85,8 @@ impl DiscordHandler {
         } else {
             RunKind::StaffRequest
         };
-        self.submit(context, message, kind, bug_report_id).await
+        self.submit(context, message, kind, bug_report_id, game_id)
+            .await
     }
 
     async fn submit(
@@ -92,6 +95,7 @@ impl DiscordHandler {
         message: &Message,
         kind: RunKind,
         bug_report_id: Option<Uuid>,
+        game_id: Option<Uuid>,
     ) -> Result<()> {
         let title = title_for(kind, bug_report_id, &message.content);
         let request_text = if message.content.trim().is_empty() {
@@ -103,6 +107,7 @@ impl DiscordHandler {
             author: message.author.name.clone(),
             text: request_text.clone(),
             bug_report_id,
+            game_id,
             attachments: discord_attachments(message)?,
         };
         let run = NewRun::new(
@@ -281,6 +286,89 @@ fn find_bug_report_id(content: &str, public_url: &Url) -> Option<Uuid> {
         .flatten()
 }
 
+fn find_game_id(content: &str, public_url: &Url) -> Option<Uuid> {
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(id) = parse_hyphenated_uuid(line) {
+            return Some(id);
+        }
+
+        let tokens: Vec<_> = line.split_whitespace().collect();
+        for (index, token) in tokens.iter().enumerate() {
+            if let Some(id) = game_id_from_url_token(token, public_url) {
+                return Some(id);
+            }
+            if let Some(id) = labeled_game_id(token, tokens.get(index + 1).copied()) {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+fn game_id_from_url_token(token: &str, public_url: &Url) -> Option<Uuid> {
+    let candidate =
+        token.trim_matches(['<', '>', '(', ')', '[', ']', '{', '}', '\'', '"', ',', '.']);
+    let parsed = Url::parse(candidate).ok()?;
+    if parsed.origin() != public_url.origin()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+        || parsed.query().is_some_and(|query| query != "post-game")
+    {
+        return None;
+    }
+
+    let path = parsed.path().trim_end_matches('/');
+    let segments: Vec<_> = path.strip_prefix('/')?.split('/').collect();
+    if !(segments.len() == 2 || segments.len() == 3)
+        || segments[0] != "games"
+        || segments.get(2).is_some_and(|tab| tab.is_empty())
+    {
+        return None;
+    }
+    let pretty_id = segments[1];
+    if pretty_id.len() != 22 {
+        return None;
+    }
+    let decoded = URL_SAFE_NO_PAD.decode(pretty_id).ok()?;
+    Uuid::from_slice(&decoded).ok()
+}
+
+fn labeled_game_id(token: &str, next: Option<&str>) -> Option<Uuid> {
+    let token = token.trim_matches(['<', '>', '(', ')', '[', ']', '{', '}', '\'', '"', ',']);
+    if let Some((label, value)) = token.split_once([':', '='])
+        && is_game_label(label)
+    {
+        if let Some(id) = parse_uuid_token(value) {
+            return Some(id);
+        }
+        return next.and_then(parse_uuid_token);
+    }
+
+    is_game_label(token.trim_end_matches([':', '=']))
+        .then(|| next.and_then(parse_uuid_token))
+        .flatten()
+}
+
+fn is_game_label(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "game" | "game-id" | "game_id" | "gameid"
+    )
+}
+
+fn parse_uuid_token(value: &str) -> Option<Uuid> {
+    parse_hyphenated_uuid(
+        value.trim_matches(['<', '>', '(', ')', '[', ']', '{', '}', '\'', '"', ',', '.']),
+    )
+}
+
+fn parse_hyphenated_uuid(value: &str) -> Option<Uuid> {
+    (value.len() == 36)
+        .then(|| Uuid::parse_str(value).ok())
+        .flatten()
+}
 fn title_for(kind: RunKind, bug_report_id: Option<Uuid>, content: &str) -> String {
     if let Some(id) = bug_report_id {
         return format!("Bug report {id}");
@@ -350,6 +438,88 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn extracts_game_ids_from_canonical_urls() {
+        let game_id = Uuid::parse_str("018e301c-3ca2-7524-9ce9-a76a1ee7a0ba").unwrap();
+        let other_id = Uuid::parse_str("018e301c-3ca2-7524-9ce9-a76a1ee7a0bb").unwrap();
+        let pretty_id = URL_SAFE_NO_PAD.encode(game_id.as_bytes());
+        let other_pretty_id = URL_SAFE_NO_PAD.encode(other_id.as_bytes());
+        let public_url = Url::parse("https://shieldbattery.net").unwrap();
+
+        assert_eq!(
+            find_game_id(
+                &format!("please inspect <https://shieldbattery.net/games/{pretty_id}>"),
+                &public_url,
+            ),
+            Some(game_id),
+        );
+        assert_eq!(
+            find_game_id(
+                &format!(
+                    "please inspect https://shieldbattery.net/games/{pretty_id}/results?post-game"
+                ),
+                &public_url,
+            ),
+            Some(game_id),
+        );
+        assert_eq!(
+            find_game_id(
+                &format!(
+                    "https://shieldbattery.net/games/{pretty_id} then https://shieldbattery.net/games/{other_pretty_id}"
+                ),
+                &public_url,
+            ),
+            Some(game_id),
+        );
+    }
+
+    #[test]
+    fn accepts_only_explicit_raw_game_ids() {
+        let game_id = Uuid::parse_str("018e301c-3ca2-7524-9ce9-a76a1ee7a0ba").unwrap();
+        let public_url = Url::parse("https://shieldbattery.net").unwrap();
+
+        assert_eq!(
+            find_game_id(&game_id.to_string(), &public_url),
+            Some(game_id)
+        );
+        assert_eq!(
+            find_game_id(&format!("game: {game_id}"), &public_url),
+            Some(game_id),
+        );
+        assert_eq!(
+            find_game_id(&format!("gameId={game_id}"), &public_url),
+            Some(game_id),
+        );
+        assert_eq!(
+            find_game_id(&format!("report {game_id}"), &public_url),
+            None,
+        );
+    }
+
+    #[test]
+    fn rejects_noncanonical_or_untrusted_game_urls() {
+        let game_id = Uuid::parse_str("018e301c-3ca2-7524-9ce9-a76a1ee7a0ba").unwrap();
+        let pretty_id = URL_SAFE_NO_PAD.encode(game_id.as_bytes());
+        let public_url = Url::parse("https://shieldbattery.net").unwrap();
+        let rejected = [
+            format!("https://evil.example/games/{pretty_id}"),
+            format!("https://user@shieldbattery.net/games/{pretty_id}"),
+            format!("https://shieldbattery.net/games/{pretty_id}?unexpected"),
+            format!("https://shieldbattery.net/games/{pretty_id}#fragment"),
+            format!("https://shieldbattery.net/games/{pretty_id}/results/extra"),
+            "https://shieldbattery.net/games/too-short".to_owned(),
+            format!("https://shieldbattery.net/admin/bug-reports/{game_id}"),
+        ];
+
+        for value in rejected {
+            assert_eq!(
+                find_game_id(&value, &public_url),
+                None,
+                "unexpectedly accepted {value}",
+            );
+        }
     }
 
     #[test]
