@@ -43,7 +43,7 @@ between untrusted reports, the Codex runner, production credentials, and product
 
 ## Workspace and deployment layout
 
-- The repository is a Rust 2024 workspace requiring Rust 1.98 or newer. The root package contains
+- The repository is a Rust 2024 workspace requiring Rust 1.98.1 or newer. The root package contains
   the Discord/orchestration service and source-sync utility; `crates/adjutant-mcp` is the isolated
   PostgreSQL MCP server.
 - Keep Rust dependencies current and commit `Cargo.lock`. Review deliberately pinned container and

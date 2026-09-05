@@ -1,5 +1,9 @@
 FROM rust:1.98-bookworm AS builder
 
+# Install the fixed compiler explicitly until its Bookworm image is published.
+ENV RUSTUP_TOOLCHAIN=1.98.1
+RUN rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+
 # This Rust utility gives the diagnostic agent a safe, well-supported way to inspect Windows
 # minidumps included in ShieldBattery reports. Build it in a source-independent layer so normal
 # Adjutant changes retain the cache.
