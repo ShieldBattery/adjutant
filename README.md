@@ -53,7 +53,11 @@ deployment's tracked configuration examples.
 
 ## Local verification
 
-The current toolchain requirement is Rust 1.98 or newer.
+The current toolchain requirement is Rust 1.98 or newer. [Rust CI](.github/workflows/rust.yml)
+runs formatting, Clippy, and workspace tests on pull requests, pushes to `main`, and `v*` tags.
+CI uses Rust 1.98.0 and the committed lockfile. Clippy warnings fail CI via `-D warnings`,
+including the enabled `all` and `pedantic` groups. Deliberate lint allowances in the manifests
+(such as `missing_errors_doc`) and narrowly scoped source attributes remain effective.
 
 ```sh
 cargo fmt --all -- --check
