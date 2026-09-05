@@ -17,15 +17,15 @@ In the Discord Developer Portal:
 2. Add a bot and enable the privileged **Message Content Intent**.
 3. Record the ID of ShieldBattery's existing bug-report webhook; Adjutant accepts no other webhook
    in that channel.
-4. Install the bot into the ShieldBattery guild with the `bot` scope and these permissions in the three
-   configured channels: View Channel, Send Messages, Attach Files, and Read Message History.
-5. Give the bot access to the existing bug-report alert channel and the private request/output
-   channels. The request and output IDs may point at the same private channel.
+4. Install the bot with the `bot` scope and View Channel, Send Messages, Attach Files, and
+   Read Message History in only staff-alerts and command-center. Do not grant Administrator.
+5. Set both request and output IDs to command-center and the bug-report ID to staff-alerts.
+   Review effective category/channel permissions so the bot cannot view member channels.
 
-Adjutant accepts automatic bug alerts only when they arrive through a webhook in the configured
-bug-report channel. It ignores bot/webhook traffic in the staff request channel. If
-`DISCORD_ALLOWED_ROLE_IDS` is set, a staff request also needs one of those role IDs; otherwise the
-private channel ACL is the authorization boundary.
+Only the configured webhook triggers automatic alert diagnoses. Human mentions and replies get
+acknowledged; Astra judges whether other staff messages warrant participation. Optional
+`DISCORD_ALLOWED_ROLE_IDS` gates human requests in both channels. See the
+[interaction guide](discord-interaction.md) for permissions, replies, status, history, and memory.
 
 ## 2. Copy and configure the deployment bundle
 
@@ -210,7 +210,7 @@ disabled on both ports. To keep MCP access local to Adjutant, set
   `SHIELDBATTERY_HOST_SOURCE_PATH` setting from `.env` when convenient. Compose creates and fills
   `source-repos` automatically; the old host checkout is no longer mounted or updated by Adjutant.
 - Stop: `docker compose down`. Compose gives active jobs up to 35 minutes to drain.
-- Back up: snapshot `adjutant-data` for requests, manifests, event JSONL, and final reports. Back up
+- Back up: snapshot `adjutant-data` for requests, manifests, event JSONL, final reports, and durable case memory. Back up
   `tailscale-state` if preserving the node identity matters. `source-repos` is reproducible from
   public GitHub and normally does not need backup. Extracted client bundles are not persisted.
 - Re-authenticate: rerun `docker compose run --rm adjutant codex login --device-auth`.

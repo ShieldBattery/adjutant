@@ -16,7 +16,8 @@ errors.
 
 - Alerts from the exact configured ShieldBattery webhook and public origin trigger bug-report
   diagnoses.
-- Staff messages and Discord attachments trigger one-off diagnoses. A canonical ShieldBattery game
+- Staff mentions and replies get acknowledged; Astra distinguishes conversation, status, and
+  investigation requests from ordinary chatter in the two staff channels. A canonical ShieldBattery game
   link (or an explicitly labeled raw game UUID) also retrieves its available flight recordings,
   replays, map, and artifact metadata through the private internal API, up to configured limits.
 - Queue depth, concurrency, generic download size, game artifact count/per-file/aggregate bytes,
@@ -37,6 +38,10 @@ errors.
   read-only service identity; neither Codex nor model-generated commands receive its token.
 - `deployment/` is a copyable, image-only VM bundle, and the GitHub Actions workflow publishes the
   bot/source-sync and MCP Dockerfile targets as separate GHCR images.
+- Native message replies connect follow-ups; substantive progress notes and status lookups keep
+  staff informed. Bounded recent context can expand through paginated channel history, and
+  searchable case notes preserve past findings and attributed corrections. See the
+  [Discord interaction guide](docs/discord-interaction.md).
 - Results are posted inline when possible and attached as `diagnosis.md` when too long for Discord.
 - The container includes Mozilla's Rust `minidump-stackwalk` utility for Windows crash dumps.
 - Startup recovery marks interrupted runs failed, and old run history is pruned automatically.

@@ -74,13 +74,22 @@ impl Config {
             bail!("MAX_GAME_ARTIFACT_BYTES cannot exceed MAX_GAME_EVIDENCE_BYTES");
         }
 
+        let discord_bug_report_channel_id = parse_required("DISCORD_BUG_REPORT_CHANNEL_ID")?;
+        let discord_request_channel_id = parse_required("DISCORD_REQUEST_CHANNEL_ID")?;
+        let discord_output_channel_id = parse_required("DISCORD_OUTPUT_CHANNEL_ID")?;
+        validate_staff_channels(
+            discord_bug_report_channel_id,
+            discord_request_channel_id,
+            discord_output_channel_id,
+        )?;
+
         Ok(Self {
             discord_token: required("DISCORD_TOKEN")?,
             discord_guild_id: parse_required("DISCORD_GUILD_ID")?,
-            discord_bug_report_channel_id: parse_required("DISCORD_BUG_REPORT_CHANNEL_ID")?,
+            discord_bug_report_channel_id,
             discord_bug_report_webhook_id: parse_required("DISCORD_BUG_REPORT_WEBHOOK_ID")?,
-            discord_request_channel_id: parse_required("DISCORD_REQUEST_CHANNEL_ID")?,
-            discord_output_channel_id: parse_required("DISCORD_OUTPUT_CHANNEL_ID")?,
+            discord_request_channel_id,
+            discord_output_channel_id,
             discord_allowed_role_ids: comma_separated("DISCORD_ALLOWED_ROLE_IDS")
                 .into_iter()
                 .map(|value| {
@@ -126,6 +135,19 @@ impl Config {
             run_retention_days: parse_positive_or("RUN_RETENTION_DAYS", 90)?,
         })
     }
+}
+
+fn validate_staff_channels(alerts: u64, requests: u64, output: u64) -> Result<()> {
+    if alerts == 0 || requests == 0 || output == 0 {
+        bail!("Discord staff channel IDs must be nonzero");
+    }
+    if requests != output {
+        bail!("DISCORD_OUTPUT_CHANNEL_ID must equal DISCORD_REQUEST_CHANNEL_ID (command-center)");
+    }
+    if alerts == requests {
+        bail!("staff-alerts and command-center must be different channels");
+    }
+    Ok(())
 }
 
 fn required(name: &str) -> Result<String> {
@@ -250,6 +272,14 @@ fn is_environment_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enforces_exactly_two_nonzero_staff_channels() {
+        assert!(super::validate_staff_channels(1, 2, 2).is_ok());
+        for (alerts, requests, output) in [(1, 2, 3), (1, 1, 1), (0, 2, 2), (1, 0, 0)] {
+            assert!(super::validate_staff_channels(alerts, requests, output).is_err());
+        }
+    }
 
     #[test]
     fn validates_environment_names() {

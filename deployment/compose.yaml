@@ -194,6 +194,13 @@ services:
       - source-repos:/workspace/repos:ro
       # Keep tool policy reviewable while auth.json remains in the private named volume.
       - ./config/codex.toml:/var/lib/adjutant/codex/config.toml:ro
+      # Shared diagnostic voice and delegation guidance, loaded from CODEX_HOME on each run.
+      - type: bind
+        source: ./config/AGENTS.md
+        target: /var/lib/adjutant/codex/AGENTS.md
+        read_only: true
+        bind:
+          create_host_path: false
     read_only: true
     cap_drop:
       - ALL

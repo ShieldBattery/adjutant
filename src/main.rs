@@ -13,6 +13,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)] // Keep service startup and ordered shutdown in one place.
 async fn main() -> Result<()> {
     #[cfg(target_os = "linux")]
     protect_process_secrets()?;
@@ -42,15 +43,36 @@ async fn main() -> Result<()> {
         collector,
         runner,
     );
-    let handler = DiscordHandler::new(Arc::clone(&config), store.clone(), queue.clone());
+    let handler = Arc::new(DiscordHandler::new(
+        Arc::clone(&config),
+        store.clone(),
+        queue.clone(),
+    ));
     let mut client = Client::builder(&config.discord_token, gateway_intents())
-        .event_handler(handler)
+        .event_handler_arc(Arc::clone(&handler))
         .await
         .context("failed to create Discord client")?;
     let shard_manager = Arc::clone(&client.shard_manager);
 
+    let context_service =
+        adjutant::context::ContextService::new(Arc::clone(&config), store.clone())?;
+    let (context_shutdown_sender, context_shutdown_receiver) = oneshot::channel();
     let (ui_shutdown_sender, ui_shutdown_receiver) = oneshot::channel();
     let (service_sender, mut service_receiver) = mpsc::unbounded_channel::<String>();
+    let context_service_sender = service_sender.clone();
+    let context_handle = tokio::spawn(async move {
+        let result = context_service
+            .serve(async {
+                let _ = context_shutdown_receiver.await;
+            })
+            .await;
+        let summary = result.as_ref().map_or_else(
+            |error| format!("staff context MCP stopped: {error:#}"),
+            |()| "staff context MCP stopped unexpectedly".to_owned(),
+        );
+        let _ = context_service_sender.send(summary);
+        result
+    });
     let ui_store = store.clone();
     let ui_bind = config.ui_bind;
     let ui_token = config.ui_token.clone();
@@ -90,11 +112,16 @@ async fn main() -> Result<()> {
         failure = service_receiver.recv() => failure,
     };
 
+    handler.shutdown_conversations().await;
     shard_manager.shutdown_all().await;
     let discord_result = discord_handle.await.context("Discord task panicked")?;
     drop(queue);
     job_shutdown.shutdown();
     job_handle.await.context("job queue task panicked")?;
+    let _ = context_shutdown_sender.send(());
+    let context_result = context_handle
+        .await
+        .context("staff context MCP task panicked")?;
     let _ = ui_shutdown_sender.send(());
     let ui_result = ui_handle.await.context("inspection UI task panicked")?;
     store.close().await;
@@ -104,6 +131,7 @@ async fn main() -> Result<()> {
     }
     discord_result?;
     ui_result?;
+    context_result?;
     info!("Adjutant stopped cleanly");
     Ok(())
 }

@@ -8,6 +8,18 @@ checkouts. Compose uses the fixed project name `adjutant`, so replacing or movin
 continues to use the existing `adjutant-data`, `codex-home`, `source-repos`, and `tailscale-state`
 volumes.
 
+## Diagnostic guidance
+
+`config/AGENTS.md` defines Adjutant's voice, investigation habits, and subagent delegation guidance.
+Compose mounts it read-only as `AGENTS.md` in the runtime `CODEX_HOME`; Codex loads it for each new
+run. This is a sanitized deployment file, independent of an operator's personal Codex guidance.
+`config/codex.toml` selects the default model and MCP tool policy. The application adds the incident
+request, evidence paths, safety instructions, and required response sections through its prompt.
+
+When updating an existing VM, copy `config/AGENTS.md` along with `compose.yaml` before recreating the
+service. The bind mount requires the file to exist. Keep the private Codex home free of a local
+`AGENTS.override.md`, which would take precedence over this shared guidance.
+
 ## First installation
 
 Install Docker Engine with the Compose plugin on a Linux x86-64 VM and make `/dev/net/tun`
@@ -101,3 +113,10 @@ docker compose logs --tail=100 source-sync
 
 The full provisioning, security, database-role, and operations notes remain in
 `docs/deployment.md` and `docs/database-mcp.md` in the source repository.
+
+Staff conversations use exactly two channels. Set `DISCORD_REQUEST_CHANNEL_ID` and
+`DISCORD_OUTPUT_CHANNEL_ID` to the same command-center ID and the bug-report channel to
+staff-alerts. Copy both `config/codex.toml` and `config/AGENTS.md` when upgrading. The new
+staff-context MCP is internal loopback only and needs no Tailscale Serve or port changes.
+Investigation case notes persist in `adjutant-data` alongside run history. The source repository's
+`docs/discord-interaction.md` explains replies, quiet progress, status, history, and memory.

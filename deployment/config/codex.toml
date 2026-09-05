@@ -1,6 +1,9 @@
 # Production Codex policy belongs in source control. Credentials belong in the codex-home volume
 # or narrowly scoped environment variables, never in this file.
 
+# Keep the diagnostic model explicit across CLI upgrades.
+model = "gpt-6-astra"
+
 [mcp_servers.shieldbattery_database]
 url = "http://127.0.0.1:8081/mcp"
 enabled = true
@@ -41,3 +44,21 @@ enabled_tools = [
 default_tools_approval_mode = "writes"
 startup_timeout_sec = 15
 tool_timeout_sec = 60
+
+# Adjutant owns Discord credentials and durable memory; the model receives read-only context tools.
+# This loopback endpoint is intentionally absent from Tailscale Serve.
+[mcp_servers.adjutant_context]
+url = "http://127.0.0.1:8083/mcp"
+enabled = true
+required = true
+enabled_tools = [
+  "read_staff_history",
+  "read_staff_message",
+  "search_staff_history",
+  "search_investigations",
+  "read_investigation",
+  "investigation_status",
+]
+default_tools_approval_mode = "writes"
+startup_timeout_sec = 10
+tool_timeout_sec = 15

@@ -1,103 +1,427 @@
+use std::fmt::Write as _;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context as _, Result};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use serde_json::json;
 use serenity::all::{
     ChannelId, Context, CreateAllowedMentions, CreateMessage, EditMessage, EventHandler,
-    GatewayIntents, Message, Ready,
+    GatewayIntents, GuildId, Message, MessageId, MessageUpdateEvent, Ready,
 };
+use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 use url::Url;
 use uuid::Uuid;
 
+use crate::codex::{CodexRunner, ConversationAction};
 use crate::config::Config;
 use crate::evidence::{Attachment, EvidenceRequest};
-use crate::jobs::{DiagnosticJob, DiscordDelivery, JobQueue, status_text};
-use crate::store::{NewRun, RunKind, Store};
+use crate::jobs::{DiagnosticJob, DiscordDelivery, JobQueue};
+use crate::store::{NewRun, RunKind, RunLink, StaffMessage, Store};
 
 const BUG_REPORT_PATH: &str = "/admin/bug-reports/";
+const MAX_CONVERSATIONS: usize = 2;
 
 pub struct DiscordHandler {
     config: Arc<Config>,
     store: Store,
     queue: JobQueue,
+    runner: CodexRunner,
+    bot_id: AtomicU64,
+    conversations: Arc<Semaphore>,
+    shutdown: tokio_util::sync::CancellationToken,
 }
 
 impl DiscordHandler {
     #[must_use]
     pub fn new(config: Arc<Config>, store: Store, queue: JobQueue) -> Self {
         Self {
+            runner: CodexRunner::new(Arc::clone(&config), store.clone()),
             config,
             store,
             queue,
+            bot_id: AtomicU64::new(0),
+            conversations: Arc::new(Semaphore::new(MAX_CONVERSATIONS)),
+            shutdown: tokio_util::sync::CancellationToken::new(),
         }
     }
 
+    pub async fn shutdown_conversations(&self) {
+        self.shutdown.cancel();
+        self.conversations.close();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(65), async {
+            while self.conversations.available_permits() < MAX_CONVERSATIONS {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+    }
+
+    fn channel_allowed(&self, channel: u64) -> bool {
+        channel == self.config.discord_bug_report_channel_id
+            || channel == self.config.discord_request_channel_id
+    }
+
+    #[allow(clippy::too_many_lines)] // One ordered routing decision with early exits.
     async fn handle_message(&self, context: &Context, message: &Message) -> Result<()> {
-        if message.guild_id.map(serenity::all::GuildId::get) != Some(self.config.discord_guild_id) {
+        if self.shutdown.is_cancelled()
+            || message.guild_id.map(GuildId::get) != Some(self.config.discord_guild_id)
+            || !self.channel_allowed(message.channel_id.get())
+        {
             return Ok(());
         }
-
-        let channel_id = message.channel_id.get();
-        let bug_alert = channel_id == self.config.discord_bug_report_channel_id
+        self.cache_message(message).await?;
+        let bug_alert = message.channel_id.get() == self.config.discord_bug_report_channel_id
             && message.webhook_id.map(serenity::all::WebhookId::get)
                 == Some(self.config.discord_bug_report_webhook_id);
-        let staff_request = channel_id == self.config.discord_request_channel_id
-            && message.webhook_id.is_none()
-            && !message.author.bot;
-        if !bug_alert && !staff_request {
+        if !bug_alert
+            && (message.webhook_id.is_some()
+                || message.author.bot
+                || !self.staff_member_is_allowed(message))
+        {
             return Ok(());
         }
-        if staff_request && !self.staff_member_is_allowed(message) {
-            warn!(
-                user_id = message.author.id.get(),
-                message_id = message.id.get(),
-                "ignored diagnostic request from a user without an allowed role"
-            );
+        if !self
+            .store
+            .claim_message(
+                self.config.discord_guild_id,
+                message.channel_id.get(),
+                message.id.get(),
+            )
+            .await?
+        {
+            return Ok(());
+        }
+        if bug_alert {
+            let report =
+                find_bug_report_id(&message.content, &self.config.shieldbattery_public_url);
+            if report.is_some() || !message.attachments.is_empty() {
+                self.submit(context, message, RunKind::BugReport, None, None)
+                    .await?;
+            }
             return Ok(());
         }
 
-        let bug_report_id =
-            find_bug_report_id(&message.content, &self.config.shieldbattery_public_url);
-        let game_id = find_game_id(&message.content, &self.config.shieldbattery_public_url);
-        if bug_alert && bug_report_id.is_none() && message.attachments.is_empty() {
-            warn!(
-                message_id = message.id.get(),
-                "ignored bug-report webhook message without a report ID or attachment"
-            );
+        let linked = self.reply_link(message).await?;
+        let addressed = directly_addressed(message, self.bot_id.load(Ordering::Relaxed));
+        let question = without_mention(&message.content, self.bot_id.load(Ordering::Relaxed));
+        if addressed && is_status_question(&question) {
+            let response = self.status_response(linked.as_ref(), "").await?;
+            let sent = self.respond(context, message, None, &response).await?;
+            self.link_response(message, &sent, linked.as_ref()).await?;
             return Ok(());
         }
-        if staff_request && message.content.trim().is_empty() && message.attachments.is_empty() {
-            message
+        let acknowledgement = if addressed {
+            Some(
+                self.respond(context, message, None, "I saw your message—taking a look.")
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let Ok(_permit) = Arc::clone(&self.conversations).try_acquire_owned() else {
+            if addressed {
+                self.respond(context, message, acknowledgement.as_ref(), "I'm handling other requests right now. Please try again shortly; I haven't started an investigation for this message.").await?;
+            }
+            return Ok(());
+        };
+        let decision_context = self.conversation_context(message, linked.as_ref()).await?;
+        let decision_result = tokio::select! {
+            biased;
+            () = self.shutdown.cancelled() => {
+                if addressed { let _ = self.respond(context, message, acknowledgement.as_ref(), "Adjutant is shutting down; no investigation was started for this message.").await; }
+                return Ok(());
+            }
+            result = self.runner.converse(&decision_context, addressed) => result,
+        };
+        let decision = match decision_result {
+            Ok(decision) => decision,
+            Err(error) => {
+                warn!(message_id = message.id.get(), %error, "conversational routing failed");
+                if addressed {
+                    self.respond(context, message, acknowledgement.as_ref(), "I couldn't process that request. Please try again; no investigation was started.").await?;
+                }
+                return Ok(());
+            }
+        };
+        if let Some(link) = &linked
+            && matches!(decision.action, ConversationAction::Remember)
+        {
+            // Keep the original staff statement and source link, without promoting it to a fact.
+            self.store
+                .save_case_observation(
+                    Uuid::parse_str(&link.conversation_id)?,
+                    &message.link(),
+                    &message.content,
+                )
+                .await?;
+        }
+        match decision.action {
+            ConversationAction::Ignore => {
+                if addressed {
+                    self.respond(
+                        context,
+                        message,
+                        acknowledgement.as_ref(),
+                        "What would you like me to check?",
+                    )
+                    .await?;
+                }
+            }
+            ConversationAction::Investigate => {
+                self.submit(
+                    context,
+                    message,
+                    RunKind::StaffRequest,
+                    linked.as_ref(),
+                    acknowledgement.as_ref(),
+                )
+                .await?;
+            }
+            ConversationAction::Status => {
+                let response = self
+                    .status_response(linked.as_ref(), &decision.query)
+                    .await?;
+                let sent = self
+                    .respond(context, message, acknowledgement.as_ref(), &response)
+                    .await?;
+                self.link_response(message, &sent, linked.as_ref()).await?;
+            }
+            ConversationAction::Remember | ConversationAction::Reply => {
+                if matches!(decision.action, ConversationAction::Remember) && linked.is_none() {
+                    self.respond(context, message, acknowledgement.as_ref(), "Please reply to the investigation this finding belongs to so I can keep the correction linked to its evidence.").await?;
+                    return Ok(());
+                }
+                let response = if decision.reply.trim().is_empty() {
+                    "What would you like me to check?"
+                } else {
+                    &decision.reply
+                };
+                let sent = self
+                    .respond(context, message, acknowledgement.as_ref(), response)
+                    .await?;
+                self.link_response(message, &sent, linked.as_ref()).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn reply_link(&self, message: &Message) -> Result<Option<RunLink>> {
+        if let Some(reference) = &message.message_reference
+            && self.channel_allowed(reference.channel_id.get())
+            && reference
+                .guild_id
+                .is_none_or(|guild| guild.get() == self.config.discord_guild_id)
+            && let Some(id) = reference.message_id
+        {
+            return self
+                .store
+                .message_run(
+                    self.config.discord_guild_id,
+                    reference.channel_id.get(),
+                    id.get(),
+                )
+                .await;
+        }
+        Ok(None)
+    }
+
+    async fn cache_message(&self, message: &Message) -> Result<()> {
+        self.store
+            .store_staff_message(&StaffMessage {
+                guild_id: self.config.discord_guild_id,
+                channel_id: message.channel_id.get(),
+                message_id: message.id.get(),
+                author: format!("{} ({})", message.author.name, message.author.id),
+                content: message.content.clone(),
+                reply_to: message
+                    .message_reference
+                    .as_ref()
+                    .and_then(|reference| reference.message_id.map(MessageId::get)),
+                created_at_ms: message.timestamp.unix_timestamp().saturating_mul(1000),
+            })
+            .await
+    }
+
+    async fn conversation_context(
+        &self,
+        message: &Message,
+        linked: Option<&RunLink>,
+    ) -> Result<String> {
+        let recent = self
+            .store
+            .recent_staff_messages(self.config.discord_guild_id, message.channel_id.get(), 12)
+            .await?;
+        let recent: Vec<_> = recent.into_iter().map(|entry| json!({"message_id":entry.message_id.to_string(),"author":entry.author,"content":truncate(&entry.content, 1000),"reply_to":entry.reply_to.map(|id| id.to_string())})).collect();
+        let active = self.store.active_runs(8).await?;
+        let active: Vec<_> = active
+            .iter()
+            .map(|run| json!({"run_id":run.id,"title":run.title,"status":run.status}))
+            .collect();
+        let reply = message.referenced_message.as_ref().filter(|reply| self.channel_allowed(reply.channel_id.get()))
+            .map(|reply| json!({"author":reply.author.name,"message_id":reply.id.to_string(),"content":truncate(&reply.content,2000)}));
+        bounded_conversation_context(json!({
+            "current_message":{"guild_id":self.config.discord_guild_id.to_string(),"channel_id":message.channel_id.get().to_string(),"message_id":message.id.get().to_string(),"author":message.author.name,"content":truncate(&message.content,8000),"attachments":message.attachments.iter().take(20).map(|a| truncate(&a.filename,100)).collect::<Vec<_>>()},
+            "recent_messages":recent,"referenced_message":reply,"linked_investigation":linked,
+            "active_investigations":active,
+            "staff_alerts_channel":self.config.discord_bug_report_channel_id.to_string(),
+            "command_center_channel":self.config.discord_request_channel_id.to_string(),
+        }))
+    }
+
+    async fn status_response(&self, linked: Option<&RunLink>, query: &str) -> Result<String> {
+        let runs = if let Some(link) = linked {
+            self.store
+                .conversation_runs(Uuid::parse_str(&link.conversation_id)?, 3)
+                .await?
+        } else if let Ok(id) = Uuid::parse_str(query.trim()) {
+            self.store
+                .get_run(&id.to_string())
+                .await?
+                .into_iter()
+                .collect()
+        } else {
+            self.store.active_runs(8).await?
+        };
+        if runs.is_empty() {
+            if let Some(link) = linked {
+                let cases = self
+                    .store
+                    .case_history(Uuid::parse_str(&link.conversation_id)?, 1)
+                    .await?;
+                if let Some(case) = cases.first() {
+                    return Ok(format!(
+                        "**{}** — historical investigation. The detailed run record has expired; the case note is retained.\n\n{}\n\n[Original request]({})",
+                        truncate(&case.title, 100),
+                        truncate(&case.summary, 1_300),
+                        case.source_url
+                    ));
+                }
+            }
+            return Ok("There are no matching active investigations. Reply to an earlier investigation to ask about that one.".to_owned());
+        }
+        let mut parts = Vec::new();
+        for run in runs {
+            let mut part = format!("**{}** — {}", truncate(&run.title, 100), run.status);
+            if let Some(progress) = self.store.get_progress(Uuid::parse_str(&run.id)?).await? {
+                if let Some(note) = progress.note {
+                    let _ = write!(part, "\nLast progress note: {}", truncate(&note, 450));
+                    if let Some(updated) = progress.note_updated_at_ms {
+                        let _ = write!(part, " (reported <t:{}:R>)", updated / 1000);
+                    }
+                }
+                if run.status == "running"
+                    && let Some(activity) = progress.activity
+                {
+                    let _ = write!(
+                        part,
+                        "\nLast observed activity: {}",
+                        truncate(&activity, 150)
+                    );
+                    if let Some(updated) = progress.activity_updated_at_ms {
+                        let _ = write!(part, " (<t:{}:R>)", updated / 1000);
+                    }
+                }
+                let _ = write!(part, "\nUpdated <t:{}:R>.", progress.updated_at_ms / 1000);
+            }
+            let _ = write!(
+                part,
+                "\n[Request](https://discord.com/channels/{}/{}/{})",
+                run.discord_guild_id, run.discord_channel_id, run.discord_message_id
+            );
+            if let Some(url) = self.run_url(Uuid::parse_str(&run.id)?) {
+                let _ = write!(part, " · [inspect]({url})");
+            }
+            if parts.iter().map(String::len).sum::<usize>() + part.len() > 5_000 {
+                break;
+            }
+            parts.push(part);
+        }
+        Ok(truncate(&parts.join("\n\n"), 1_850))
+    }
+
+    async fn respond(
+        &self,
+        context: &Context,
+        source: &Message,
+        existing: Option<&Message>,
+        text: &str,
+    ) -> Result<Message> {
+        let text = truncate(text, 1_900);
+        let mentions = CreateAllowedMentions::new().replied_user(false);
+        if let Some(existing) = existing {
+            Ok(existing
+                .channel_id
+                .edit_message(
+                    &context.http,
+                    existing.id,
+                    EditMessage::new().content(text).allowed_mentions(mentions),
+                )
+                .await?)
+        } else {
+            Ok(source
                 .channel_id
                 .send_message(
                     &context.http,
                     CreateMessage::new()
-                        .content("Please include a diagnostic question or attach evidence.")
-                        .allowed_mentions(CreateAllowedMentions::new()),
+                        .content(text)
+                        .reference_message(source)
+                        .allowed_mentions(mentions),
                 )
-                .await?;
-            return Ok(());
+                .await?)
         }
-
-        let kind = if bug_alert {
-            RunKind::BugReport
-        } else {
-            RunKind::StaffRequest
-        };
-        self.submit(context, message, kind, bug_report_id, game_id)
-            .await
     }
 
+    async fn link_response(
+        &self,
+        source: &Message,
+        response: &Message,
+        linked: Option<&RunLink>,
+    ) -> Result<()> {
+        if let Some(link) = linked {
+            let run = Uuid::parse_str(&link.run_id)?;
+            let conversation = Uuid::parse_str(&link.conversation_id)?;
+            for message in [source, response] {
+                self.store
+                    .link_message(
+                        run,
+                        conversation,
+                        self.config.discord_guild_id,
+                        message.channel_id.get(),
+                        message.id.get(),
+                    )
+                    .await?;
+            }
+        }
+        self.cache_message(response).await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)] // Persist and acknowledge before enqueueing.
     async fn submit(
         &self,
         context: &Context,
         message: &Message,
         kind: RunKind,
-        bug_report_id: Option<Uuid>,
-        game_id: Option<Uuid>,
+        linked: Option<&RunLink>,
+        acknowledgement: Option<&Message>,
     ) -> Result<()> {
-        let title = title_for(kind, bug_report_id, &message.content);
+        let mut bug_report_id =
+            find_bug_report_id(&message.content, &self.config.shieldbattery_public_url);
+        if bug_report_id.is_none()
+            && let Some(link) = linked
+            && let Some(previous) = self.store.get_run(&link.run_id).await?
+        {
+            bug_report_id = previous
+                .bug_report_id
+                .and_then(|id| Uuid::parse_str(&id).ok());
+        }
+        let title = title_for(
+            kind,
+            bug_report_id,
+            &without_mention(&message.content, self.bot_id.load(Ordering::Relaxed)),
+        );
         let request_text = if message.content.trim().is_empty() {
             "Inspect the attached evidence and diagnose the reported problem.".to_owned()
         } else {
@@ -107,33 +431,56 @@ impl DiscordHandler {
             author: message.author.name.clone(),
             text: request_text.clone(),
             bug_report_id,
-            game_id,
+            game_id: find_game_id(&message.content, &self.config.shieldbattery_public_url),
             attachments: discord_attachments(message)?,
         };
         let run = NewRun::new(
             kind,
             title.clone(),
-            request_text.clone(),
+            request_text,
             bug_report_id,
             self.config.discord_guild_id,
             message.channel_id.get(),
             message.id.get(),
         );
         self.store.create_run(&run).await?;
-
+        let conversation_id = linked
+            .map(|link| Uuid::parse_str(&link.conversation_id))
+            .transpose()?
+            .unwrap_or(run.id);
+        self.store
+            .link_message(
+                run.id,
+                conversation_id,
+                self.config.discord_guild_id,
+                message.channel_id.get(),
+                message.id.get(),
+            )
+            .await?;
         let source_url = message.link();
         let run_url = self.run_url(run.id);
-        let output_channel = ChannelId::new(self.config.discord_output_channel_id);
-        let status_message = match self
-            .post_queued_status(
-                context,
-                output_channel,
-                run.id,
-                &source_url,
-                run_url.as_ref(),
-            )
-            .await
-        {
+        // Automatic alert results live in command-center; addressed human conversations reply in place.
+        let output_channel = if matches!(kind, RunKind::BugReport) {
+            ChannelId::new(self.config.discord_output_channel_id)
+        } else {
+            message.channel_id
+        };
+        let queued = initial_status(run.id, &source_url, run_url.as_ref());
+        let status_result = if output_channel == message.channel_id {
+            self.respond(context, message, acknowledgement, &queued)
+                .await
+        } else {
+            output_channel
+                .send_message(
+                    &context.http,
+                    CreateMessage::new()
+                        .content(queued)
+                        .allowed_mentions(CreateAllowedMentions::new().replied_user(false)),
+                )
+                .await
+                .map_err(Into::into)
+        };
+        let status_message = match status_result {
             Ok(status) => status,
             Err(error) => {
                 self.store
@@ -142,66 +489,52 @@ impl DiscordHandler {
                 return Err(error);
             }
         };
-
+        self.store
+            .link_message(
+                run.id,
+                conversation_id,
+                self.config.discord_guild_id,
+                output_channel.get(),
+                status_message.id.get(),
+            )
+            .await?;
+        self.cache_message(&status_message).await?;
+        let reply_to = if output_channel == message.channel_id {
+            message.id
+        } else {
+            status_message.id
+        };
         let delivery = DiscordDelivery {
             http: Arc::clone(&context.http),
             output_channel,
             status_message: status_message.id,
+            reply_to,
+            guild_id: self.config.discord_guild_id,
             source_url,
             run_url,
         };
         let job = DiagnosticJob {
             run_id: run.id,
+            conversation_id,
             title,
             request: evidence,
             delivery,
         };
-        if let Err(queue_error) = self.queue.try_enqueue(job) {
-            self.store
-                .fail_run(run.id, &queue_error.to_string())
-                .await?;
-            let status_body = status_text(
-                &DiscordDelivery {
-                    http: Arc::clone(&context.http),
-                    output_channel,
-                    status_message: status_message.id,
-                    source_url: message.link(),
-                    run_url: self.run_url(run.id),
-                },
-                run.id,
-                "❌",
-                &format!("Could not queue this run: {queue_error}."),
-            );
+        if let Err(error) = self.queue.try_enqueue(job) {
+            self.store.fail_run(run.id, &error.to_string()).await?;
             output_channel
                 .edit_message(
                     &context.http,
                     status_message.id,
                     EditMessage::new()
-                        .content(status_body)
-                        .allowed_mentions(CreateAllowedMentions::new()),
+                        .content(format!(
+                            "Could not queue this investigation: {error}. Please try again later."
+                        ))
+                        .allowed_mentions(CreateAllowedMentions::new().replied_user(false)),
                 )
                 .await?;
         }
         Ok(())
-    }
-
-    async fn post_queued_status(
-        &self,
-        context: &Context,
-        output_channel: ChannelId,
-        run_id: Uuid,
-        source_url: &str,
-        run_url: Option<&Url>,
-    ) -> anyhow::Result<Message> {
-        output_channel
-            .send_message(
-                &context.http,
-                CreateMessage::new()
-                    .content(initial_status(run_id, source_url, run_url))
-                    .allowed_mentions(CreateAllowedMentions::new()),
-            )
-            .await
-            .map_err(Into::into)
     }
 
     fn staff_member_is_allowed(&self, message: &Message) -> bool {
@@ -213,7 +546,6 @@ impl DiscordHandler {
                     .any(|role| self.config.discord_allowed_role_ids.contains(&role.get()))
             })
     }
-
     fn run_url(&self, run_id: Uuid) -> Option<Url> {
         self.config
             .ui_base_url
@@ -226,22 +558,123 @@ impl DiscordHandler {
 impl EventHandler for DiscordHandler {
     async fn message(&self, context: Context, message: Message) {
         if let Err(error) = self.handle_message(&context, &message).await {
-            error!(
-                message_id = message.id.get(),
-                error = ?error,
-                "failed to handle Discord message"
-            );
+            error!(message_id=message.id.get(),error=?error,"failed to handle Discord message");
         }
     }
-
     async fn ready(&self, _context: Context, ready: Ready) {
-        info!(user = %ready.user.name, "Discord bot connected");
+        self.bot_id.store(ready.user.id.get(), Ordering::Relaxed);
+        info!(user=%ready.user.name,"Discord bot connected");
+    }
+    async fn message_delete(
+        &self,
+        _context: Context,
+        channel: ChannelId,
+        id: MessageId,
+        guild: Option<GuildId>,
+    ) {
+        if guild.map(GuildId::get) == Some(self.config.discord_guild_id)
+            && self.channel_allowed(channel.get())
+        {
+            let _ = self
+                .store
+                .delete_staff_message(self.config.discord_guild_id, channel.get(), id.get())
+                .await;
+        }
+    }
+    async fn message_delete_bulk(
+        &self,
+        context: Context,
+        channel: ChannelId,
+        ids: Vec<MessageId>,
+        guild: Option<GuildId>,
+    ) {
+        for id in ids {
+            self.message_delete(context.clone(), channel, id, guild)
+                .await;
+        }
+    }
+    async fn message_update(
+        &self,
+        _context: Context,
+        _old: Option<Message>,
+        new: Option<Message>,
+        event: MessageUpdateEvent,
+    ) {
+        if !self.channel_allowed(event.channel_id.get())
+            || event.guild_id.map(GuildId::get) != Some(self.config.discord_guild_id)
+        {
+            return;
+        }
+        // Drop stale cached text even when Discord sends only a partial update. History can refetch it.
+        let _ = self
+            .store
+            .delete_staff_message(
+                self.config.discord_guild_id,
+                event.channel_id.get(),
+                event.id.get(),
+            )
+            .await;
+        if let Some(new) = new {
+            let _ = self.cache_message(&new).await;
+        }
     }
 }
 
 #[must_use]
 pub const fn gateway_intents() -> GatewayIntents {
     GatewayIntents::GUILD_MESSAGES.union(GatewayIntents::MESSAGE_CONTENT)
+}
+
+fn bounded_conversation_context(mut context: serde_json::Value) -> Result<String> {
+    // Keep structured service IDs intact when unusually large messages require trimming.
+    loop {
+        let encoded = serde_json::to_string(&context)?;
+        if encoded.len() <= 40 * 1024 {
+            return Ok(encoded);
+        }
+        if let Some(recent) = context["recent_messages"].as_array_mut()
+            && recent.pop().is_some()
+        {
+            continue;
+        }
+        if let Some(content) = context["current_message"]["content"].as_str()
+            && content.chars().count() > 1000
+        {
+            context["current_message"]["content"] = json!(truncate(content, 1000));
+            continue;
+        }
+        anyhow::bail!("conversation context exceeded its byte budget");
+    }
+}
+
+fn directly_addressed(message: &Message, bot_id: u64) -> bool {
+    bot_id != 0
+        && (message.mentions.iter().any(|user| user.id.get() == bot_id)
+            || message
+                .referenced_message
+                .as_ref()
+                .is_some_and(|reply| reply.author.id.get() == bot_id))
+}
+fn without_mention(text: &str, bot_id: u64) -> String {
+    text.replace(&format!("<@{bot_id}>"), "")
+        .replace(&format!("<@!{bot_id}>"), "")
+        .trim()
+        .to_owned()
+}
+fn is_status_question(text: &str) -> bool {
+    matches!(
+        text.trim()
+            .trim_end_matches(['?', '!', '.'])
+            .to_ascii_lowercase()
+            .as_str(),
+        "status"
+            | "status please"
+            | "any update"
+            | "any updates"
+            | "how's it going"
+            | "where are we"
+            | "what are you working on"
+    )
 }
 
 fn discord_attachments(message: &Message) -> Result<Vec<Attachment>> {
@@ -404,6 +837,59 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_budget_preserves_structural_ids_and_valid_json() {
+        let id = Uuid::now_v7();
+        let context = json!({
+            "current_message": {"content": "\u{1f600}".repeat(8000)},
+            "recent_messages": (0..12).map(|_| json!({"content": "\u{1f600}".repeat(1000)})).collect::<Vec<_>>(),
+            "active_investigations": [{"run_id":id.to_string()}]
+        });
+        let encoded = bounded_conversation_context(context).unwrap();
+        assert!(encoded.len() <= 40 * 1024);
+        let decoded: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            decoded["active_investigations"][0]["run_id"],
+            id.to_string()
+        );
+    }
+
+    #[test]
+    fn direct_mentions_and_replies_are_attention_not_role_or_everyone_pings() {
+        let mut message = Message::default();
+        message.content = "Adjutant might be useful here".to_owned();
+        assert!(!directly_addressed(&message, 42));
+        message.mention_everyone = true;
+        assert!(!directly_addressed(&message, 42));
+        let mut user = serenity::all::User::default();
+        user.id = serenity::all::UserId::new(42);
+        message.mentions.push(user.clone());
+        assert!(directly_addressed(&message, 42));
+        assert!(!directly_addressed(&message, 0));
+        message.mentions.clear();
+        let mut reference = Message::default();
+        reference.author = user;
+        message.referenced_message = Some(Box::new(reference));
+        assert!(directly_addressed(&message, 42));
+        assert!(!directly_addressed(&message, 43));
+    }
+
+    #[test]
+    fn status_fast_path_does_not_consume_diagnostic_questions() {
+        assert!(is_status_question(&without_mention("<@42> status?", 42)));
+        assert!(is_status_question(&without_mention(
+            "<@!42> any updates?",
+            42
+        )));
+        assert!(!is_status_question(
+            "check the server status for yesterday's disconnect"
+        ));
+        assert!(!is_status_question(
+            "status of the relay and investigate the crash"
+        ));
+        assert_eq!(without_mention("<@43> status", 42), "<@43> status");
+    }
 
     #[test]
     fn extracts_only_complete_bug_report_ids_after_admin_path() {

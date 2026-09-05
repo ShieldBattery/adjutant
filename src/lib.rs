@@ -1,5 +1,6 @@
 pub mod codex;
 pub mod config;
+pub mod context;
 pub mod discord;
 pub mod evidence;
 pub mod jobs;

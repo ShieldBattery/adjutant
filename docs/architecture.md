@@ -98,3 +98,17 @@ reviewed subset of Datadog's read-only tools. Their credentials belong only to s
 and both production identities lack write privileges.
 `CODEX_ENV_PASSTHROUGH` is an explicit allowlist; Adjutant rejects attempts to pass its Discord or
 UI credentials into Codex.
+
+## Staff context and conversation routing
+
+The orchestrator filters to the configured two guild channels before caching or handling events.
+Short, bounded Codex invocations decide participation and route conversation separately from the
+diagnostic queue. Explicit attention gets acknowledged first. Related diagnostics serialize by
+conversation while independent investigations share the configured concurrency budget.
+
+A read-only context MCP at shared loopback port 8083 exposes validated live Discord history,
+cached search, retained cases, attributed staff statements, and run status. It has no Tailscale
+Serve route. Only the parent holds the Discord credential and writes memory or messages. Short
+routing invocations disable shell/subagents and production MCPs; diagnostics retain their existing
+read-only tools. History and memory are evidence, not instructions. See the
+[interaction guide](discord-interaction.md) for limits, retention, and deployment permissions.
