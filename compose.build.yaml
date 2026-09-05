@@ -15,7 +15,7 @@ services:
       context: ..
       target: runtime
       args:
-        CODEX_VERSION: 0.150.1
+        CODEX_VERSION: 0.153.4
     volumes:
       - type: bind
         source: ../../shieldbattery
@@ -42,4 +42,4 @@ services:
       context: ..
       target: runtime
       args:
-        CODEX_VERSION: 0.150.1
+        CODEX_VERSION: 0.153.4

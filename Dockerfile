@@ -14,7 +14,7 @@ RUN cargo build --locked --release --workspace
 
 FROM node:24-bookworm-slim AS runtime
 
-ARG CODEX_VERSION=0.150.1
+ARG CODEX_VERSION=0.153.4
 ENV CODEX_HOME=/var/lib/adjutant/codex \
     HOME=/var/lib/adjutant \
     NPM_CONFIG_UPDATE_NOTIFIER=false
