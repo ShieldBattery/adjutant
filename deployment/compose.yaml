@@ -22,7 +22,8 @@ services:
       - ./tailscale:/config:ro
     devices:
       - /dev/net/tun:/dev/net/tun
-    read_only: true
+    # MagicDNS setup writes /etc/resolv.conf, its backup, and temporary files under /etc.
+    read_only: false
     cap_drop:
       - ALL
     cap_add:

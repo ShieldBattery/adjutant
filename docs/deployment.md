@@ -101,10 +101,16 @@ The MCP container is the only service that receives `mcp.env`; Codex and the Dis
 the database password.
 
 The sidecar needs writable `/run` for both its LocalAPI socket and the firewall's
-`/run/xtables.lock`. Compose supplies a temporary filesystem there while keeping the root
-filesystem read-only. If an older bundle reports `can't open lock file /run/xtables.lock:
-Read-only file system`, update `compose.yaml` and recreate the Tailscale service. Keep the
-`tailscale-state` named volume, which stores the node's identity.
+`/run/xtables.lock`; Compose supplies a temporary filesystem there. Its root filesystem must also
+be writable: Tailscale's direct DNS manager creates a backup and temporary files under `/etc`
+before updating `/etc/resolv.conf` with the MagicDNS resolver and Tailnet search domain.
+Docker shares that resolver file with the services using `network_mode: service:tailscale`.
+Adjutant, the database MCP, the Datadog proxy, and source-sync retain their read-only filesystems.
+
+If an older bundle reports `can't open lock file /run/xtables.lock: Read-only file system` or
+cannot apply its DNS configuration, update `compose.yaml` and recreate the Tailscale service and
+the services sharing its network namespace. Keep the `tailscale-state` named volume, which stores
+the node's identity.
 
 Bring up the sidecar and wait for it to become healthy before starting dependent services:
 
@@ -260,6 +266,13 @@ disabled on both ports. To keep MCP access local to Adjutant, set
   This verifies that the node has a Tailnet IP, the database login can connect, and the Datadog proxy
   is listening—not end-to-end ShieldBattery or Datadog reachability. Use separate synthetic checks
   if those paths need proactive alerting.
+- Database hostname resolution: inspect `docker compose exec tailscale cat /etc/resolv.conf`.
+  With MagicDNS enabled and `TS_ACCEPT_DNS=true`, expect Tailscale's `100.100.100.100` nameserver and
+  your Tailnet search domain. If it still points at Docker's `127.0.0.11` resolver, check the
+  Tailscale logs for DNS configuration errors and ensure its root filesystem is writable.
+  Compare a direct lookup with `docker compose exec tailscale nslookup <full-db-tailnet-hostname>
+  100.100.100.100`, replacing the placeholder with the database node's actual full hostname.
+  The sidecar health check only checks for a Tailnet IP; it does not prove DNS is configured.
 - Retention: `RUN_RETENTION_DAYS` is applied at startup. Client logs and dumps live only in per-run
   temporary storage and are removed after the process finishes.
 - Limits: if `JOB_TIMEOUT_SECONDS` is raised above 1800, also keep
