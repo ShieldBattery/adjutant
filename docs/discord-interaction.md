@@ -43,6 +43,26 @@ attached when the preview omits content. The inspector and investigation memory 
 report. Important uncertainty and blockers belong in the summary. Blocked investigations should
 stay brief instead of repeating missing evidence under every heading.
 
+## Forwarded messages
+
+Adjutant includes Discord's forwarded snapshots as quoted evidence in routing, cached and live
+history, investigations, and follow-up updates. This includes forwarded text, embed text and fields,
+and attachment metadata. Forwarded attachments on a request use the existing bounded evidence
+collector, with at most 20 attachments across the message and its snapshot. Attachments in a
+separate earlier forward are included as metadata; neighboring messages do not automatically
+add file downloads to a request.
+
+Discord can send a forward and its accompanying comment as separate channel messages. Adjutant
+keeps bounded nearby discussion in the investigation input, so a subsequent "please advise" can
+refer to the forwarded post. It does not automatically start an investigation just because someone
+forwards a message, and quoted mentions do not count as new mentions of Adjutant. A forward's source
+is attribution, not a reply to an investigation. Discord omits the original author from snapshots;
+Adjutant does not invent that identity or fetch the originating channel.
+
+One snapshot level is included, within existing message and history limits. The request and its
+nearby context together are limited to 16,000 bytes. If context is truncated, the agent can use its
+read-only staff history tools to inspect the relevant message in a configured channel.
+
 ## Collecting more evidence
 
 Staff messages can include a canonical bug-report link inline with their request, on a separate

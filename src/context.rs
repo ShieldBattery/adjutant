@@ -35,6 +35,9 @@ use uuid::Uuid;
 
 use crate::{
     config::Config,
+    discord_content::{
+        EvidenceText, MAX_ATTACHMENTS, MAX_EMBED_FIELDS, MAX_EMBEDS, MAX_FORWARDED_SNAPSHOTS,
+    },
     store::{CaseRecord, ProgressSnapshot, RunRecord, StaffMessage, Store},
 };
 
@@ -193,6 +196,8 @@ struct DiscordAuthor {
 #[derive(Debug, Deserialize)]
 struct DiscordMessageReference {
     message_id: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<u8>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -202,6 +207,22 @@ struct DiscordMessage {
     author: DiscordAuthor,
     content: String,
     message_reference: Option<DiscordMessageReference>,
+    #[serde(default)]
+    message_snapshots: Vec<DiscordMessageSnapshot>,
+    #[serde(default)]
+    embeds: Vec<DiscordEmbed>,
+    #[serde(default)]
+    attachments: Vec<DiscordAttachment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscordMessageSnapshot {
+    message: DiscordSnapshotMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscordSnapshotMessage {
+    content: String,
     #[serde(default)]
     embeds: Vec<DiscordEmbed>,
     #[serde(default)]
@@ -213,6 +234,14 @@ struct DiscordEmbed {
     title: Option<String>,
     description: Option<String>,
     url: Option<String>,
+    #[serde(default)]
+    fields: Vec<DiscordEmbedField>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscordEmbedField {
+    name: String,
+    value: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -426,6 +455,7 @@ impl ContextService {
         let reply_to = message
             .message_reference
             .as_ref()
+            .filter(|reference| reference.kind.is_none_or(|kind| kind == 0))
             .and_then(|reference| reference.message_id.as_deref())
             .map(|id| parse_snowflake(id, "Discord reply message id"))
             .transpose()?;
@@ -745,39 +775,62 @@ fn snowflake_created_at_ms(snowflake: u64) -> i64 {
 }
 
 fn discord_evidence_text(message: &DiscordMessage) -> String {
-    let mut text = String::new();
-    append_evidence_line(&mut text, "message", &message.content);
-    for embed in &message.embeds {
-        if let Some(title) = &embed.title {
-            append_evidence_line(&mut text, "embed title", title);
-        }
-        if let Some(description) = &embed.description {
-            append_evidence_line(&mut text, "embed description", description);
-        }
-        if let Some(url) = &embed.url {
-            append_evidence_line(&mut text, "embed URL", url);
+    let mut text = EvidenceText::new(&message.content, MAX_EXACT_CONTENT_BYTES);
+    append_embeds(&mut text, "embed", &message.embeds);
+    append_attachments(&mut text, "attachment metadata", &message.attachments);
+
+    if message
+        .message_reference
+        .as_ref()
+        .is_some_and(|reference| reference.kind == Some(1))
+    {
+        for snapshot in message
+            .message_snapshots
+            .iter()
+            .take(MAX_FORWARDED_SNAPSHOTS)
+        {
+            append_forwarded_snapshot(&mut text, snapshot);
         }
     }
-    for attachment in &message.attachments {
-        append_evidence_line(
-            &mut text,
-            "attachment metadata",
-            &format!("{} - {}", attachment.filename, attachment.url),
-        );
-    }
-    truncate_utf8(&text, MAX_EXACT_CONTENT_BYTES)
+    text.finish()
 }
 
-fn append_evidence_line(text: &mut String, label: &str, value: &str) {
-    if value.is_empty() {
-        return;
+fn append_forwarded_snapshot(text: &mut EvidenceText, snapshot: &DiscordMessageSnapshot) {
+    const FORWARDED: &str = "forwarded message (quoted evidence; original author unavailable)";
+
+    let content = if snapshot.message.content.is_empty() {
+        "[no text]"
+    } else {
+        &snapshot.message.content
+    };
+    text.push(FORWARDED, content);
+    append_embeds(text, "forwarded embed", &snapshot.message.embeds);
+    append_attachments(text, "forwarded attachment", &snapshot.message.attachments);
+}
+
+fn append_embeds(text: &mut EvidenceText, prefix: &str, embeds: &[DiscordEmbed]) {
+    for embed in embeds.iter().take(MAX_EMBEDS) {
+        if let Some(title) = &embed.title {
+            text.push(&format!("{prefix} title"), title);
+        }
+        if let Some(description) = &embed.description {
+            text.push(&format!("{prefix} description"), description);
+        }
+        if let Some(url) = &embed.url {
+            text.push(&format!("{prefix} url"), url);
+        }
+        for field in embed.fields.iter().take(MAX_EMBED_FIELDS) {
+            text.push(&format!("{prefix} field name"), &field.name);
+            text.push(&format!("{prefix} field value"), &field.value);
+        }
     }
-    if !text.is_empty() {
-        text.push('\n');
+}
+
+fn append_attachments(text: &mut EvidenceText, prefix: &str, attachments: &[DiscordAttachment]) {
+    for attachment in attachments.iter().take(MAX_ATTACHMENTS) {
+        text.push(&format!("{prefix} filename"), &attachment.filename);
+        text.push(&format!("{prefix} url"), &attachment.url);
     }
-    text.push_str(label);
-    text.push_str(": ");
-    text.push_str(value);
 }
 
 fn discord_message_url(guild_id: u64, channel_id: u64, message_id: u64) -> String {
@@ -997,6 +1050,92 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn rest_forwarded_snapshot_is_quoted_evidence_not_a_reply() {
+        let (_directory, service) = synthetic_service().await;
+        let message: super::DiscordMessage = serde_json::from_value(json!({
+            "id": "100", "channel_id": "2", "author": {"username": "staff"},
+            "content": "please inspect", "message_reference": {"type": 1, "message_id": "99"},
+            "message_snapshots": [{"message": {
+                "content": "forwarded report",
+                "embeds": [{"title": "snapshot title", "description": "snapshot description",
+                    "url": "https://example.invalid/embed",
+                    "fields": [{"name": "build", "value": "test"}]}],
+                "attachments": [{"filename": "report.zip", "url": "https://cdn.invalid/report.zip"}]
+            }}]
+        }))
+        .unwrap();
+
+        let staff = service.staff_message_from_discord(2, &message).unwrap();
+        assert_eq!(staff.reply_to, None);
+        assert!(staff.content.contains(
+            "forwarded message (quoted evidence; original author unavailable): forwarded report"
+        ));
+        assert!(
+            staff
+                .content
+                .contains("forwarded embed title: snapshot title")
+        );
+        assert!(staff.content.contains("field name: build"));
+        assert!(staff.content.contains("field value: test"));
+        assert!(staff.content.contains("report.zip"));
+        assert!(staff.content.contains("https://cdn.invalid/report.zip"));
+    }
+
+    #[test]
+    fn rest_embed_only_forward_keeps_the_quoted_evidence_label() {
+        let message: super::DiscordMessage = serde_json::from_value(json!({
+            "id": "100", "channel_id": "2", "author": {"username": "staff"},
+            "content": "", "message_reference": {"type": 1},
+            "message_snapshots": [{"message": {
+                "content": "", "embeds": [{"title": "embed-only evidence"}]
+            }}]
+        }))
+        .unwrap();
+        let content = super::discord_evidence_text(&message);
+        assert!(content.contains(
+            "forwarded message (quoted evidence; original author unavailable): [no text]"
+        ));
+        assert!(content.contains("forwarded embed title: embed-only evidence"));
+    }
+    #[tokio::test]
+    async fn rest_default_and_absent_reference_types_remain_replies_and_ignore_snapshots() {
+        let (_directory, service) = synthetic_service().await;
+        for reference in [
+            json!({"message_id": "99"}),
+            json!({"type": 0, "message_id": "99"}),
+        ] {
+            let message: super::DiscordMessage = serde_json::from_value(json!({
+                "id": "100", "channel_id": "2", "author": {"username": "staff"},
+                "content": "reply", "message_reference": reference,
+                "message_snapshots": [{"message": {"content": "must not appear"}}]
+            }))
+            .unwrap();
+            let staff = service.staff_message_from_discord(2, &message).unwrap();
+            assert_eq!(staff.reply_to, Some(99));
+            assert!(!staff.content.contains("must not appear"));
+        }
+    }
+
+    #[test]
+    fn rest_forwarded_snapshot_count_and_unicode_are_bounded() {
+        let message: super::DiscordMessage = serde_json::from_value(json!({
+            "id": "100", "channel_id": "2", "author": {"username": "staff"},
+            "content": "", "message_reference": {"type": 1},
+            "message_snapshots": [
+                {"message": {"content": "\u{1f642}".repeat(2_000)}},
+                {"message": {"content": "second snapshot must not appear"}}
+            ]
+        }))
+        .unwrap();
+        let content = super::discord_evidence_text(&message);
+        assert!(content.len() <= super::MAX_EXACT_CONTENT_BYTES);
+        assert!(
+            content.contains("forwarded message (quoted evidence; original author unavailable)")
+        );
+        assert!(!content.contains("second snapshot must not appear"));
+        assert!(std::str::from_utf8(content.as_bytes()).is_ok());
+    }
     #[tokio::test]
     async fn mcp_transport_initializes_lists_and_calls_without_discord_network_access() {
         let (_directory, service) = synthetic_service().await;

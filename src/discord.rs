@@ -7,7 +7,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::json;
 use serenity::all::{
     ChannelId, Context, CreateAllowedMentions, CreateMessage, EventHandler, GatewayIntents,
-    GuildId, Message, MessageId, MessageUpdateEvent, Ready,
+    GuildId, Message, MessageId, MessageReferenceKind, MessageSnapshot, MessageUpdateEvent, Ready,
 };
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
@@ -16,12 +16,17 @@ use uuid::Uuid;
 
 use crate::codex::{CodexRunner, ConversationAction, SteerOutcome, SteeringUpdate};
 use crate::config::Config;
+use crate::discord_content::{
+    EvidenceText, MAX_ATTACHMENTS, MAX_EMBED_FIELDS, MAX_EMBEDS, MAX_FORWARDED_SNAPSHOTS,
+};
 use crate::evidence::{Attachment, EvidenceRequest};
 use crate::jobs::{DiagnosticJob, DiscordDelivery, JobQueue, send_notice, update_status};
 use crate::store::{NewRun, RunKind, RunLink, StaffMessage, Store};
 
 const BUG_REPORT_PATH: &str = "/admin/bug-reports/";
 const MAX_CONVERSATIONS: usize = 2;
+const MAX_MESSAGE_CONTENT_BYTES: usize = 8_000;
+const MAX_INVESTIGATION_TEXT_BYTES: usize = 16_000;
 
 pub struct DiscordHandler {
     config: Arc<Config>,
@@ -105,6 +110,11 @@ impl DiscordHandler {
             return Ok(());
         }
 
+        // A forward is often followed by a separate staff comment. Cache the snapshot now, but
+        // do not interpret its quoted contents as a new request from the forwarding user.
+        if is_forward(message) && message.content.trim().is_empty() {
+            return Ok(());
+        }
         let linked = self.reply_link(message).await?;
         let bot_id = self.bot_id.load(Ordering::Relaxed);
         let addressed = directly_addressed(message, bot_id, self.config.discord_mention_role_id)
@@ -114,7 +124,10 @@ impl DiscordHandler {
             bot_id,
             self.config.discord_mention_role_id,
         );
-        if addressed && is_status_question(&question) {
+        if addressed
+            && forwarded_snapshots(message).next().is_none()
+            && is_status_question(&question)
+        {
             let response = self.status_response(linked.as_ref(), "").await?;
             let sent = self.respond(context, message, &response).await?;
             self.link_response(message, &sent, linked.as_ref()).await?;
@@ -213,7 +226,7 @@ impl DiscordHandler {
                 .save_case_observation(
                     Uuid::parse_str(&link.conversation_id)?,
                     &message.link(),
-                    &message.content,
+                    &message_evidence_text(message),
                 )
                 .await?;
         }
@@ -305,7 +318,9 @@ impl DiscordHandler {
                 message_id: message.id.get(),
                 author_id: message.author.id.get(),
                 author: message.author.name.clone(),
-                text: message.content.clone(),
+                text: self
+                    .request_with_context(message, &message_evidence_text(message))
+                    .await?,
                 source_url: message.link(),
             };
             let outcome = self.runner.steer(run_id, update).await;
@@ -323,7 +338,7 @@ impl DiscordHandler {
                             .save_case_observation(
                                 Uuid::parse_str(&link.conversation_id)?,
                                 &message.link(),
-                                &message.content,
+                                &message_evidence_text(message),
                             )
                             .await
                         {
@@ -357,6 +372,7 @@ impl DiscordHandler {
 
     async fn reply_link(&self, message: &Message) -> Result<Option<RunLink>> {
         if let Some(reference) = &message.message_reference
+            && reference.kind == MessageReferenceKind::Default
             && self.channel_allowed(reference.channel_id.get())
             && reference
                 .guild_id
@@ -377,18 +393,10 @@ impl DiscordHandler {
 
     async fn cache_message(&self, message: &Message) -> Result<()> {
         self.store
-            .store_staff_message(&StaffMessage {
-                guild_id: self.config.discord_guild_id,
-                channel_id: message.channel_id.get(),
-                message_id: message.id.get(),
-                author: format!("{} ({})", message.author.name, message.author.id),
-                content: message.content.clone(),
-                reply_to: message
-                    .message_reference
-                    .as_ref()
-                    .and_then(|reference| reference.message_id.map(MessageId::get)),
-                created_at_ms: message.timestamp.unix_timestamp().saturating_mul(1000),
-            })
+            .store_staff_message(&gateway_staff_message(
+                message,
+                self.config.discord_guild_id,
+            ))
             .await
     }
 
@@ -408,16 +416,38 @@ impl DiscordHandler {
             .iter()
             .map(|run| json!({"run_id":run.id,"title":run.title,"status":run.status}))
             .collect();
-        let reply = message.referenced_message.as_ref().filter(|reply| self.channel_allowed(reply.channel_id.get()))
-            .map(|reply| json!({"author":reply.author.name,"message_id":reply.id.to_string(),"content":truncate(&reply.content,2000)}));
+        let reply = self.referenced_message(message).map(|reply| json!({"author":reply.author.name,"message_id":reply.id.to_string(),"content":truncate(&message_evidence_text(reply),2000)}));
         bounded_conversation_context(json!({
-            "current_message":{"guild_id":self.config.discord_guild_id.to_string(),"channel_id":message.channel_id.get().to_string(),"message_id":message.id.get().to_string(),"author":message.author.name,"content":truncate(&message.content,8000),"attachments":message.attachments.iter().take(20).map(|a| truncate(&a.filename,100)).collect::<Vec<_>>()},
+            "current_message":{"guild_id":self.config.discord_guild_id.to_string(),"channel_id":message.channel_id.get().to_string(),"message_id":message.id.get().to_string(),"author":message.author.name,"content":message_evidence_text(message),"attachments":message.attachments.iter().take(20).map(|a| truncate(&a.filename,100)).collect::<Vec<_>>()},
             "recent_messages":recent,"referenced_message":reply,"linked_investigation":linked,
             "active_investigations":active,
             "steerable_investigation":steer_target.map(|id| json!({"run_id":id})),
             "staff_alerts_channel":self.config.discord_bug_report_channel_id.to_string(),
             "command_center_channel":self.config.discord_request_channel_id.to_string(),
         }))
+    }
+
+    fn referenced_message<'a>(&self, message: &'a Message) -> Option<&'a Message> {
+        message.referenced_message.as_deref().filter(|reply| {
+            !is_forward(message)
+                && self.channel_allowed(reply.channel_id.get())
+                && reply
+                    .guild_id
+                    .is_none_or(|guild| guild.get() == self.config.discord_guild_id)
+        })
+    }
+
+    async fn request_with_context(&self, message: &Message, request_text: &str) -> Result<String> {
+        let recent = self
+            .store
+            .recent_staff_messages(self.config.discord_guild_id, message.channel_id.get(), 12)
+            .await?;
+        Ok(investigation_text(
+            message,
+            request_text,
+            self.referenced_message(message),
+            &recent,
+        ))
     }
 
     async fn status_response(&self, linked: Option<&RunLink>, query: &str) -> Result<String> {
@@ -551,10 +581,11 @@ impl DiscordHandler {
         linked: Option<&RunLink>,
         acknowledgement: Option<&Message>,
     ) -> Result<()> {
+        let message_text = message_evidence_text(message);
         let mut bug_report_id = if matches!(kind, RunKind::BugReport) {
             find_bug_report_id_in_alert(&message.content, &self.config.shieldbattery_public_url)
         } else {
-            find_bug_report_id_in_text(&message.content, &self.config.shieldbattery_public_url)
+            find_bug_report_id_in_text(&message_text, &self.config.shieldbattery_public_url)
         };
         if bug_report_id.is_none()
             && let Some(link) = linked
@@ -573,16 +604,16 @@ impl DiscordHandler {
                 self.config.discord_mention_role_id,
             ),
         );
-        let request_text = if message.content.trim().is_empty() {
+        let request_text = if message_text.trim().is_empty() {
             "Inspect the attached evidence and diagnose the reported problem.".to_owned()
         } else {
-            message.content.trim().to_owned()
+            message_text.trim().to_owned()
         };
         let evidence = EvidenceRequest {
             author: message.author.name.clone(),
-            text: request_text.clone(),
+            text: self.request_with_context(message, &request_text).await?,
             bug_report_id,
-            game_id: find_game_id(&message.content, &self.config.shieldbattery_public_url),
+            game_id: find_game_id(&message_text, &self.config.shieldbattery_public_url),
             attachments: discord_attachments(message)?,
         };
         let run = NewRun::new(
@@ -809,20 +840,23 @@ fn bounded_conversation_context(mut context: serde_json::Value) -> Result<String
 }
 
 fn can_steer_message(message: &Message, linked: Option<&RunLink>, public_url: &Url) -> bool {
+    let content = message_evidence_text(message);
     linked.is_some()
         && message.attachments.is_empty()
-        && !message.content.trim().is_empty()
-        && find_game_id(&message.content, public_url).is_none()
-        && find_bug_report_id_in_text(&message.content, public_url).is_none()
+        && forwarded_snapshots(message).all(|snapshot| snapshot.attachments.is_empty())
+        && !content.trim().is_empty()
+        && find_game_id(&content, public_url).is_none()
+        && find_bug_report_id_in_text(&content, public_url).is_none()
 }
 
 fn directly_addressed(message: &Message, bot_id: u64, mention_role_id: Option<u64>) -> bool {
     (bot_id != 0
         && (message.mentions.iter().any(|user| user.id.get() == bot_id)
-            || message
-                .referenced_message
-                .as_ref()
-                .is_some_and(|reply| reply.author.id.get() == bot_id)))
+            || !is_forward(message)
+                && message
+                    .referenced_message
+                    .as_ref()
+                    .is_some_and(|reply| reply.author.id.get() == bot_id)))
         || mention_role_id.is_some_and(|role_id| {
             message
                 .mention_roles
@@ -856,10 +890,131 @@ fn is_status_question(text: &str) -> bool {
     )
 }
 
-fn discord_attachments(message: &Message) -> Result<Vec<Attachment>> {
+fn gateway_staff_message(message: &Message, guild_id: u64) -> StaffMessage {
+    StaffMessage {
+        guild_id,
+        channel_id: message.channel_id.get(),
+        message_id: message.id.get(),
+        author: format!("{} ({})", message.author.name, message.author.id),
+        content: message_evidence_text(message),
+        reply_to: message
+            .message_reference
+            .as_ref()
+            .filter(|reference| reference.kind == MessageReferenceKind::Default)
+            .and_then(|reference| reference.message_id.map(MessageId::get)),
+        created_at_ms: message.timestamp.unix_timestamp().saturating_mul(1000),
+    }
+}
+
+fn is_forward(message: &Message) -> bool {
     message
+        .message_reference
+        .as_ref()
+        .is_some_and(|reference| reference.kind == MessageReferenceKind::Forward)
+}
+
+fn forwarded_snapshots(message: &Message) -> impl Iterator<Item = &MessageSnapshot> {
+    message
+        .message_snapshots
+        .iter()
+        .take(if is_forward(message) {
+            MAX_FORWARDED_SNAPSHOTS
+        } else {
+            0
+        })
+}
+
+fn message_evidence_text(message: &Message) -> String {
+    let mut text = EvidenceText::new(&message.content, MAX_MESSAGE_CONTENT_BYTES);
+    for snapshot in forwarded_snapshots(message) {
+        text.push(
+            "forwarded message (quoted evidence; original author unavailable)",
+            if snapshot.content.is_empty() {
+                "[no text]"
+            } else {
+                &snapshot.content
+            },
+        );
+        if let Some(reference) = &message.message_reference {
+            text.push(
+                "forwarded source",
+                &format!(
+                    "channel_id={}, message_id={}",
+                    reference.channel_id,
+                    reference
+                        .message_id
+                        .map_or_else(|| "unknown".to_owned(), |id| id.to_string()),
+                ),
+            );
+        }
+        for embed in snapshot.embeds.iter().take(MAX_EMBEDS) {
+            for (label, value) in [
+                ("forwarded embed title", embed.title.as_deref()),
+                ("forwarded embed description", embed.description.as_deref()),
+                ("forwarded embed URL", embed.url.as_deref()),
+            ] {
+                if let Some(value) = value {
+                    text.push(label, value);
+                }
+            }
+            for field in embed.fields.iter().take(MAX_EMBED_FIELDS) {
+                text.push("forwarded embed field name", &field.name);
+                text.push("forwarded embed field value", &field.value);
+            }
+        }
+        for attachment in snapshot.attachments.iter().take(MAX_ATTACHMENTS) {
+            text.push("forwarded attachment filename", &attachment.filename);
+            text.push("forwarded attachment URL", &attachment.url);
+        }
+    }
+    text.finish()
+}
+
+/// Keep the same nearby discussion available after triage chooses to investigate. A forward and
+/// its accompanying request can have distinct message IDs, so neither the router's paraphrase nor
+/// the current message alone is sufficient. These records remain attributed, untrusted evidence.
+fn investigation_text(
+    message: &Message,
+    request_text: &str,
+    referenced: Option<&Message>,
+    recent: &[StaffMessage],
+) -> String {
+    let mut text = EvidenceText::new(request_text, MAX_INVESTIGATION_TEXT_BYTES);
+    text.push("source message", &message.link());
+    if let Some(reply) = referenced {
+        let record = json!({"message_id":reply.id.to_string(),"author":reply.author.name,
+            "content":EvidenceText::new(&message_evidence_text(reply), 2_000).finish()});
+        text.push("referenced message (quoted evidence)", &record.to_string());
+    }
+    for entry in recent
+        .iter()
+        .filter(|entry| entry.message_id < message.id.get())
+        .take(12)
+    {
+        let record = json!({"message_id":entry.message_id.to_string(),"author":truncate(&entry.author,100),
+            "content":EvidenceText::new(&entry.content,1_000).finish()});
+        text.push(
+            "recent channel message (quoted evidence)",
+            &record.to_string(),
+        );
+    }
+    text.finish()
+}
+
+fn discord_attachments(message: &Message) -> Result<Vec<Attachment>> {
+    let attachments: Vec<_> = message
         .attachments
         .iter()
+        .chain(forwarded_snapshots(message).flat_map(|snapshot| &snapshot.attachments))
+        .take(MAX_ATTACHMENTS + 1)
+        .collect();
+    if attachments.len() > MAX_ATTACHMENTS {
+        anyhow::bail!(
+            "message and forwarded evidence exceed the {MAX_ATTACHMENTS} attachment limit"
+        );
+    }
+    attachments
+        .into_iter()
         .map(|attachment| {
             Ok(Attachment {
                 url: Url::parse(&attachment.url).with_context(|| {
@@ -1046,6 +1201,171 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn forwarded_message(content: &str) -> Message {
+        let mut message = serde_json::to_value(Message::default()).unwrap();
+        message["id"] = json!("300");
+        message["channel_id"] = json!("2");
+        message["guild_id"] = json!("1");
+        message["content"] = json!("adjutant please advise");
+        message["message_reference"] =
+            json!({"type":1,"message_id":"100","channel_id":"99","guild_id":"9"});
+        message["message_snapshots"] = json!([{"message":{
+            "type":0,"content":content,"timestamp":"2026-09-06T08:00:00Z",
+            "edited_timestamp":null,"mentions":[],"mention_roles":[],
+            "attachments":[],"embeds":[],"flags":0,
+        }}]);
+        let mut message: Message = serde_json::from_value(message).unwrap();
+        message.timestamp = serenity::all::Timestamp::now();
+        message
+    }
+
+    #[test]
+    fn forwarded_gateway_text_keeps_report_links_and_provenance_without_reply_linkage() {
+        let id = Uuid::now_v7();
+        let public_url = Url::parse("https://shieldbattery.invalid").unwrap();
+        let quoted = format!(
+            "new bug report: synthetic details\nhttps://shieldbattery.invalid/admin/bug-reports/{id}"
+        );
+        let message = forwarded_message(&quoted);
+        let stored = gateway_staff_message(&message, 1);
+        assert!(stored.content.starts_with("adjutant please advise\n"));
+        assert!(
+            stored
+                .content
+                .contains("forwarded message (quoted evidence; original author unavailable)")
+        );
+        assert!(stored.content.contains(&quoted));
+        assert!(stored.content.contains("channel_id=99, message_id=100"));
+        assert_eq!(stored.reply_to, None);
+        assert_eq!(
+            find_bug_report_id_in_text(&stored.content, &public_url),
+            Some(id)
+        );
+        let link = RunLink {
+            run_id: Uuid::now_v7().to_string(),
+            conversation_id: Uuid::now_v7().to_string(),
+        };
+        assert!(!can_steer_message(&message, Some(&link), &public_url));
+        assert!(investigation_text(&message, &stored.content, None, &[]).contains(&quoted));
+    }
+
+    #[tokio::test]
+    async fn cached_forward_reaches_a_separate_request_without_merging_message_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("forward.sqlite"))
+            .await
+            .unwrap();
+        let id = Uuid::now_v7();
+        let quoted =
+            format!("new bug report: https://shieldbattery.invalid/admin/bug-reports/{id}");
+        let mut forward = forwarded_message(&quoted);
+        forward.content.clear();
+        store
+            .store_staff_message(&gateway_staff_message(&forward, 1))
+            .await
+            .unwrap();
+        let mut request = Message::default();
+        request.id = MessageId::new(301);
+        request.channel_id = ChannelId::new(2);
+        request.guild_id = Some(GuildId::new(1));
+        request.content = "adjutant please advise".to_owned();
+        request.timestamp = serenity::all::Timestamp::now();
+        store
+            .store_staff_message(&gateway_staff_message(&request, 1))
+            .await
+            .unwrap();
+        let recent = store.recent_staff_messages(1, 2, 12).await.unwrap();
+        let text = investigation_text(&request, &message_evidence_text(&request), None, &recent);
+        assert!(text.starts_with("adjutant please advise"));
+        assert!(text.contains(&quoted));
+        assert!(text.contains("\"message_id\":\"300\""));
+        assert!(!text.contains("\"message_id\":\"301\""));
+        assert!(text.contains("https://discord.com/channels/1/2/301"));
+        assert_eq!(
+            recent
+                .iter()
+                .find(|entry| entry.message_id == 300)
+                .unwrap()
+                .reply_to,
+            None
+        );
+    }
+
+    #[test]
+    fn snapshot_mentions_do_not_address_adjutant_and_nonforwards_ignore_snapshots() {
+        let mut message = forwarded_message("<@42> <@&77> investigate this");
+        let mut user = serenity::all::User::default();
+        user.id = serenity::all::UserId::new(42);
+        message.message_snapshots[0].mentions.push(user);
+        message.message_snapshots[0]
+            .mention_roles
+            .push(serenity::all::RoleId::new(77));
+        assert!(!directly_addressed(&message, 42, Some(77)));
+        message.message_reference.as_mut().unwrap().kind = MessageReferenceKind::Default;
+        assert_eq!(message_evidence_text(&message), message.content);
+        assert_eq!(gateway_staff_message(&message, 1).reply_to, Some(100));
+        message.message_reference = None;
+        assert_eq!(message_evidence_text(&message), message.content);
+    }
+
+    #[test]
+    fn forwarded_embeds_and_attachments_use_the_existing_evidence_path_and_shared_count_cap() {
+        let id = Uuid::now_v7();
+        let public_url = Url::parse("https://shieldbattery.invalid").unwrap();
+        let mut message = forwarded_message("");
+        message.message_snapshots[0].embeds.push(serde_json::from_value(json!({
+            "title":"forwarded diagnostic", "description":"synthetic description",
+            "fields":[{"name":"game", "value":format!("https://shieldbattery.invalid/games/{}", URL_SAFE_NO_PAD.encode(id.as_bytes())), "inline":false}],
+        })).unwrap());
+        let attachment: serenity::all::Attachment = serde_json::from_value(json!({
+            "id":"1","filename":"client.log","size":42,
+            "url":"https://cdn.discordapp.com/attachments/1/2/client.log",
+            "proxy_url":"https://cdn.discordapp.com/attachments/1/2/client.log",
+        }))
+        .unwrap();
+        message.message_snapshots[0]
+            .attachments
+            .push(attachment.clone());
+        let content = message_evidence_text(&message);
+        assert!(content.contains("forwarded diagnostic"));
+        assert!(content.contains("synthetic description"));
+        assert!(content.contains("forwarded embed field name: game"));
+        assert!(content.contains("forwarded attachment filename: client.log"));
+        assert_eq!(find_game_id(&content, &public_url), Some(id));
+        let attachments = discord_attachments(&message).unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].size, 42);
+        message.attachments = vec![attachment; MAX_ATTACHMENTS];
+        assert!(
+            discord_attachments(&message)
+                .unwrap_err()
+                .to_string()
+                .contains("attachment limit")
+        );
+    }
+
+    #[test]
+    fn forwarded_text_is_bounded_without_promoting_additional_snapshots() {
+        let mut message = forwarded_message(&"\u{1f600}".repeat(8_000));
+        let mut extra = message.message_snapshots[0].clone();
+        extra.content = "do not include a second snapshot".to_owned();
+        message.message_snapshots.push(extra);
+        let content = message_evidence_text(&message);
+        assert!(content.len() <= MAX_MESSAGE_CONTENT_BYTES);
+        assert!(content.starts_with("adjutant please advise"));
+        assert!(!content.contains("do not include a second snapshot"));
+        let recent: Vec<_> = (1..13)
+            .map(|id| {
+                let mut entry = gateway_staff_message(&message, 1);
+                entry.message_id = id;
+                entry
+            })
+            .collect();
+        let text = investigation_text(&message, &content, None, &recent);
+        assert!(text.len() <= MAX_INVESTIGATION_TEXT_BYTES);
+        assert!(text.contains("recent channel message"));
+    }
 
     #[test]
     fn context_budget_preserves_structural_ids_and_valid_json() {
