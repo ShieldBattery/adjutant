@@ -4,12 +4,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use tokio::sync::mpsc;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use super::*;
 use crate::config::Config;
+use crate::evidence::{EvidenceCollector, EvidenceRequest, EvidenceRequests};
 use crate::store::{NewRun, RunKind, Store};
 
 struct Harness {
@@ -19,6 +21,15 @@ struct Harness {
 }
 
 async fn harness(timeout: Duration, events: usize, bytes: usize) -> Harness {
+    harness_with_internal(timeout, events, bytes, None).await
+}
+
+async fn harness_with_internal(
+    timeout: Duration,
+    events: usize,
+    bytes: usize,
+    shieldbattery_internal_url: Option<url::Url>,
+) -> Harness {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(&directory.path().join("runs.sqlite3"))
         .await
@@ -44,7 +55,7 @@ async fn harness(timeout: Duration, events: usize, bytes: usize) -> Harness {
         discord_mention_role_id: None,
         discord_allowed_role_ids: HashSet::new(),
         shieldbattery_public_url: "https://shieldbattery.invalid".parse().unwrap(),
-        shieldbattery_internal_url: None,
+        shieldbattery_internal_url,
         codex_bin: "codex".to_owned(),
         codex_home: PathBuf::from("codex-home"),
         codex_profile: None,
@@ -101,6 +112,30 @@ fn start(
     mpsc::Sender<Frame>,
     Uuid,
 ) {
+    start_session(h, None)
+}
+
+fn start_with_evidence(
+    h: &Harness,
+    requests: EvidenceRequests,
+) -> (
+    tokio::task::JoinHandle<anyhow::Result<String>>,
+    BufReader<tokio::io::DuplexStream>,
+    mpsc::Sender<Frame>,
+    Uuid,
+) {
+    start_session(h, Some(requests))
+}
+
+fn start_session(
+    h: &Harness,
+    requests: Option<EvidenceRequests>,
+) -> (
+    tokio::task::JoinHandle<anyhow::Result<String>>,
+    BufReader<tokio::io::DuplexStream>,
+    mpsc::Sender<Frame>,
+    Uuid,
+) {
     let (client, peer) = tokio::io::duplex(32 * 1024);
     let (tx, mut rx) = mpsc::channel(8);
     let runner = Arc::clone(&h.runner);
@@ -108,28 +143,377 @@ fn start(
     let conversation = Uuid::now_v7();
     let task = tokio::spawn(async move {
         let cwd = PathBuf::from(".");
-        Session::new(
+        let session = Session::new(
             &runner,
             run_id,
             client,
             &mut rx,
             Arc::new(EventBudget::new(&runner.config)),
-        )
-        .investigate(conversation, &cwd, "prompt")
-        .await
+        );
+        let mut session = match requests {
+            Some(requests) => session.with_evidence(requests),
+            None => session,
+        };
+        session.investigate(conversation, &cwd, "prompt").await
     });
     (task, BufReader::new(peer), tx, conversation)
 }
 
+async fn evidence_requests(h: &Harness) -> EvidenceRequests {
+    EvidenceCollector::new(Arc::clone(&h.runner.config))
+        .unwrap()
+        .collect(
+            h.run_id,
+            &EvidenceRequest {
+                author: "test".to_owned(),
+                text: "test".to_owned(),
+                bug_report_id: None,
+                game_id: None,
+                attachments: Vec::new(),
+            },
+        )
+        .await
+        .unwrap()
+        .requests
+}
+
 async fn establish(reader: &mut BufReader<tokio::io::DuplexStream>, tx: &mpsc::Sender<Frame>) {
-    assert_eq!(outgoing(reader).await["method"], "initialize");
+    let initialize = outgoing(reader).await;
+    assert_eq!(initialize["method"], "initialize");
+    assert_eq!(
+        initialize["params"]["capabilities"]["experimentalApi"],
+        false
+    );
     incoming(tx, json!({"id":1,"result":{}})).await;
     assert_eq!(outgoing(reader).await["method"], "initialized");
-    assert_eq!(outgoing(reader).await["method"], "thread/start");
+    let started = outgoing(reader).await;
+    assert_eq!(started["method"], "thread/start");
+    assert!(started["params"].get("dynamicTools").is_none());
     incoming(tx, json!({"id":2,"result":thread("thread-1")})).await;
     assert_eq!(outgoing(reader).await["method"], "turn/start");
 }
 
+async fn establish_with_evidence(
+    reader: &mut BufReader<tokio::io::DuplexStream>,
+    tx: &mpsc::Sender<Frame>,
+) {
+    let initialize = outgoing(reader).await;
+    assert_eq!(initialize["method"], "initialize");
+    assert_eq!(
+        initialize["params"]["capabilities"]["experimentalApi"],
+        true
+    );
+    incoming(tx, json!({"id":1,"result":{}})).await;
+    assert_eq!(outgoing(reader).await["method"], "initialized");
+    let started = outgoing(reader).await;
+    assert_eq!(started["method"], "thread/start");
+    assert_eq!(started["params"]["dynamicTools"], dynamic_tools());
+    incoming(tx, json!({"id":2,"result":thread("thread-1")})).await;
+    assert_eq!(outgoing(reader).await["method"], "turn/start");
+}
+
+fn dynamic_call(request_id: &Value, call_id: &str, tool: &str, arguments: &Value) -> Value {
+    json!({
+        "id":request_id,
+        "method":"item/tool/call",
+        "params":{
+            "threadId":"thread-1",
+            "turnId":"turn-1",
+            "callId":call_id,
+            "namespace":null,
+            "tool":tool,
+            "arguments":arguments,
+        },
+    })
+}
+
+async fn serve_one_json(body: String) -> url::Url {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap())
+        .parse()
+        .unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 2048];
+        let _ = stream.read(&mut request).await.unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    });
+    base
+}
+
+async fn block_one_http() -> (url::Url, oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap())
+        .parse()
+        .unwrap();
+    let (connected_tx, connected_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 2048];
+        let _ = stream.read(&mut request).await.unwrap();
+        let _ = connected_tx.send(());
+        let _ = release_rx.await;
+        let _ = stream
+            .write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+            .await;
+    });
+    (base, connected_rx, release_tx)
+}
+
+#[tokio::test]
+async fn completed_turn_rejects_late_dynamic_request_during_pending_steer() {
+    let h = harness(Duration::from_secs(2), 100, 100_000).await;
+    let requests = evidence_requests(&h).await;
+    let (task, mut reader, tx, _) = start_with_evidence(&h, requests);
+    establish_with_evidence(&mut reader, &tx).await;
+    incoming(&tx, json!({"id":3,"result":turn("turn-1")})).await;
+    let sender = submit_update(&h, &mut reader).await;
+    finish(&tx, "completed before late tool").await;
+    incoming(
+        &tx,
+        dynamic_call(
+            &json!("late-tool"),
+            "call-late",
+            "request_bug_report",
+            &json!({"report_id":Uuid::now_v7()}),
+        ),
+    )
+    .await;
+    let rejected = outgoing(&mut reader).await;
+    assert_eq!(rejected["id"], "late-tool");
+    assert_eq!(rejected["result"]["success"], false);
+    assert_eq!(
+        rejected["result"]["contentItems"][0]["text"],
+        "dynamic evidence request arrived after the active turn completed"
+    );
+    incoming(&tx, json!({"id":4,"result":{"turnId":"turn-1"}})).await;
+    assert_eq!(sender.await.unwrap(), SteerOutcome::Accepted);
+    assert_eq!(task.await.unwrap().unwrap(), "completed before late tool");
+}
+#[tokio::test]
+async fn dynamic_tools_are_strict_before_turn_start_response() {
+    let h = harness(Duration::from_secs(2), 100, 100_000).await;
+    let requests = evidence_requests(&h).await;
+    let (task, mut reader, tx, _) = start_with_evidence(&h, requests);
+    establish_with_evidence(&mut reader, &tx).await;
+
+    incoming(
+        &tx,
+        dynamic_call(
+            &json!("tool-invalid"),
+            "call-invalid",
+            "request_bug_report",
+            &json!({"report_id":Uuid::now_v7().to_string(), "unexpected":true}),
+        ),
+    )
+    .await;
+    let response = tokio::time::timeout(Duration::from_secs(1), outgoing(&mut reader))
+        .await
+        .unwrap();
+    assert_eq!(response["id"], "tool-invalid");
+    assert_eq!(response["result"]["success"], false);
+    assert_eq!(
+        response["result"]["contentItems"][0]["text"],
+        "dynamic evidence request had invalid arguments"
+    );
+
+    incoming(&tx, json!({"id":3,"result":turn("turn-1")})).await;
+    finish(&tx, "strict protocol").await;
+    assert_eq!(task.await.unwrap().unwrap(), "strict protocol");
+}
+
+#[tokio::test]
+async fn early_dynamic_tool_publishes_manifest_after_audit_budget_is_exhausted() {
+    let report_id = Uuid::now_v7();
+    let body = json!({
+        "report":{
+            "id":report_id,
+            "submitterId":null,
+            "details":"test report",
+            "logsDeleted":true,
+            "createdAt":1,
+            "resolvedAt":null,
+            "resolverId":null,
+        }
+    })
+    .to_string();
+    let base = serve_one_json(body).await;
+    let h = harness_with_internal(Duration::from_secs(2), 1, 100_000, Some(base)).await;
+    let requests = evidence_requests(&h).await;
+    let (task, mut reader, tx, _) = start_with_evidence(&h, requests);
+    establish_with_evidence(&mut reader, &tx).await;
+
+    incoming(
+        &tx,
+        dynamic_call(
+            &json!(91),
+            "call-success",
+            "request_bug_report",
+            &json!({"report_id":report_id}),
+        ),
+    )
+    .await;
+    let response = tokio::time::timeout(Duration::from_secs(1), outgoing(&mut reader))
+        .await
+        .unwrap();
+    assert_eq!(response["id"], 91);
+    assert_eq!(response["result"]["success"], true);
+    assert_eq!(
+        serde_json::from_str::<Value>(
+            response["result"]["contentItems"][0]["text"]
+                .as_str()
+                .unwrap()
+        )
+        .unwrap()["id"],
+        report_id.to_string()
+    );
+    let stored = h
+        .runner
+        .store
+        .get_run(&h.run_id.to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        stored
+            .evidence_manifest
+            .unwrap()
+            .contains("bug-report.json")
+    );
+
+    assert!(
+        h.runner
+            .store
+            .get_events(&h.run_id.to_string())
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| event.event_json.contains("adjutant.events_truncated"))
+    );
+    incoming(&tx, json!({"id":3,"result":turn("turn-1")})).await;
+    finish(&tx, "manifest published").await;
+    assert_eq!(task.await.unwrap().unwrap(), "manifest published");
+}
+
+#[tokio::test]
+async fn pending_dynamic_collection_keeps_steering_responsive_and_is_cancelled_with_session() {
+    let (base, connected, release) = block_one_http().await;
+    let h = harness_with_internal(Duration::from_secs(2), 100, 100_000, Some(base)).await;
+    let requests = evidence_requests(&h).await;
+    let (task, mut reader, tx, conversation) = start_with_evidence(&h, requests);
+    establish_with_evidence(&mut reader, &tx).await;
+    incoming(&tx, json!({"id":3,"result":turn("turn-1")})).await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while h.runner.steering.target(conversation) != Some(h.run_id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    incoming(
+        &tx,
+        dynamic_call(
+            &json!("tool-pending"),
+            "call-pending",
+            "request_bug_report",
+            &json!({"report_id":Uuid::now_v7()}),
+        ),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(1), connected)
+        .await
+        .unwrap()
+        .unwrap();
+    let sender = submit_update(&h, &mut reader).await;
+    incoming(&tx, json!({"id":4,"result":{"turnId":"turn-1"}})).await;
+    assert_eq!(sender.await.unwrap(), SteerOutcome::Accepted);
+
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let _ = release.send(());
+    let mut remaining = String::new();
+    reader.read_to_string(&mut remaining).await.unwrap();
+    assert!(remaining.is_empty());
+    assert_eq!(h.runner.steering.target(conversation), None);
+}
+
+#[tokio::test]
+async fn dynamic_requests_cannot_target_another_thread_or_turn() {
+    for (field, value) in [("threadId", "other-thread"), ("turnId", "other-turn")] {
+        let h = harness(Duration::from_secs(2), 100, 100_000).await;
+        let requests = evidence_requests(&h).await;
+        let (task, mut reader, tx, _) = start_with_evidence(&h, requests.clone());
+        establish_with_evidence(&mut reader, &tx).await;
+        incoming(&tx, json!({"id":3,"result":turn("turn-1")})).await;
+        let mut call = dynamic_call(
+            &json!("wrong-target"),
+            "call-wrong-target",
+            "request_bug_report",
+            &json!({"report_id":Uuid::now_v7()}),
+        );
+        call["params"][field] = json!(value);
+        incoming(&tx, call).await;
+        let rejected = outgoing(&mut reader).await;
+        assert_eq!(rejected["result"]["success"], false);
+        assert_eq!(
+            rejected["result"]["contentItems"][0]["text"],
+            "dynamic evidence request did not match the active investigation"
+        );
+        assert!(
+            task.await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("different")
+        );
+        assert_eq!(requests.manifest_json().await.unwrap(), "[]");
+    }
+}
+
+#[tokio::test]
+async fn dynamic_tool_attempt_budget_counts_invalid_tool_requests() {
+    let h = harness(Duration::from_secs(2), 100, 100_000).await;
+    let requests = evidence_requests(&h).await;
+    let (task, mut reader, tx, _) = start_with_evidence(&h, requests);
+    establish_with_evidence(&mut reader, &tx).await;
+    for number in 0..=MAX_DYNAMIC_TOOL_ATTEMPTS {
+        incoming(
+            &tx,
+            dynamic_call(
+                &json!(number),
+                &format!("call-{number}"),
+                "not_a_dynamic_tool",
+                &json!({}),
+            ),
+        )
+        .await;
+    }
+    for number in 0..MAX_DYNAMIC_TOOL_ATTEMPTS {
+        let response = outgoing(&mut reader).await;
+        assert_eq!(response["id"], number as u64);
+        assert_eq!(response["result"]["success"], false);
+        assert_eq!(
+            response["result"]["contentItems"][0]["text"],
+            "dynamic evidence request named an unsupported tool"
+        );
+    }
+    let limited = outgoing(&mut reader).await;
+    assert_eq!(limited["id"], MAX_DYNAMIC_TOOL_ATTEMPTS as u64);
+    assert_eq!(
+        limited["result"]["contentItems"][0]["text"],
+        "dynamic evidence request limit reached"
+    );
+
+    incoming(&tx, json!({"id":3,"result":turn("turn-1")})).await;
+    finish(&tx, "attempts bounded").await;
+    assert_eq!(task.await.unwrap().unwrap(), "attempts bounded");
+}
 #[tokio::test]
 async fn accepts_final_answer_and_ignores_commentary_progress() {
     let h = harness(Duration::from_secs(2), 100, 100_000).await;

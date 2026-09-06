@@ -43,6 +43,25 @@ attached when the preview omits content. The inspector and investigation memory 
 report. Important uncertainty and blockers belong in the summary. Blocked investigations should
 stay brief instead of repeating missing evidence under every heading.
 
+## Collecting more evidence
+
+Staff messages can include a canonical bug-report link inline with their request, on a separate
+line, or as a Markdown link. Adjutant extracts its ID and retrieves the report through the
+configured internal API. Automatic webhook alerts still use only their final report-link line,
+so a URL inside submitted report text cannot replace the alert's actual report ID.
+
+During an investigation, Codex can also call `request_bug_report` with a report UUID or
+`request_game_artifacts` with a game UUID. The latter collects the available map file, replays,
+flight recordings, and artifact metadata. `get_game_diagnostics` on the database MCP provides
+game details, participants, results, map metadata, and netcode history.
+
+These evidence tools run through the host's existing internal API client. They accept typed IDs,
+return local paths, and publish completed files into the current workspace with an updated
+manifest in the inspector. Repeated IDs reuse the collected files. Initial and later collection
+share archive expansion/file limits and game artifact count/byte limits. Each run allows eight
+uncached collection attempts; failed requests also consume an attempt. Codex commands remain
+read-only with networking disabled. Reports with expired logs can still supply their metadata.
+
 ## Updating an investigation
 
 Reply to an investigation's acknowledgement, dashboard, progress message, original request, or

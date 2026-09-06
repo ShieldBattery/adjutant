@@ -20,6 +20,10 @@ errors.
   investigation requests from ordinary chatter in the two staff channels. A canonical ShieldBattery game
   link (or an explicitly labeled raw game UUID) also retrieves its available flight recordings,
   replays, map, and artifact metadata through the private internal API, up to configured limits.
+- Bug-report links work inline in staff requests. Codex can also request a report or a game's
+  available maps, replays, flight recordings, and artifact metadata by ID during an investigation.
+  The host collects them through the internal API and updates the evidence manifest; repeated IDs
+  reuse existing files and collection limits apply across the whole run.
 - Queue depth, concurrency, generic download size, game artifact count/per-file/aggregate bytes,
   aggregate ZIP expansion/file count, event history, process count, and end-to-end runtime are bounded.
 - The Discord credential and any legacy `ADJUTANT_UI_TOKEN` value never enter the Codex child

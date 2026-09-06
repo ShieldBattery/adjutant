@@ -3,6 +3,7 @@
 //! Only this module constructs requests. Staff text cannot select an RPC method, turn,
 //! model, or sandbox. The inspector retains emitted data within the shared output budget.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,8 +13,11 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
-use tracing::{Instrument, info};
+use tokio::task::JoinSet;
+use tracing::{Instrument, info, warn};
 use uuid::Uuid;
+
+use crate::evidence::{EvidenceKind, EvidenceRequests};
 
 use super::steering::{SteerOutcome, SteerRequest, SteeringUpdate};
 use super::{
@@ -27,11 +31,115 @@ const RPC_DEADLINE: Duration = Duration::from_secs(10);
 const STARTUP_RPC_DEADLINE: Duration = Duration::from_secs(60);
 const CLEANUP_DEADLINE: Duration = Duration::from_secs(2);
 const STDOUT_QUEUE: usize = 8;
+const MAX_PENDING_DYNAMIC_TOOLS: usize = 4;
+const MAX_DYNAMIC_TOOL_ATTEMPTS: usize = 16;
+const MAX_DYNAMIC_REQUEST_ID_BYTES: usize = 256;
+const MAX_DYNAMIC_CALL_ID_BYTES: usize = 256;
+const MAX_DYNAMIC_RECEIPT_BYTES: usize = 16 * 1024;
 
 enum Frame {
     Line(String),
     Oversized,
     Eof,
+}
+
+#[derive(Clone, Copy)]
+enum DynamicEvidenceTool {
+    BugReport,
+    GameArtifacts,
+}
+
+impl DynamicEvidenceTool {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::BugReport => "request_bug_report",
+            Self::GameArtifacts => "request_game_artifacts",
+        }
+    }
+
+    const fn argument_name(self) -> &'static str {
+        match self {
+            Self::BugReport => "report_id",
+            Self::GameArtifacts => "game_id",
+        }
+    }
+
+    const fn evidence_kind(self) -> EvidenceKind {
+        match self {
+            Self::BugReport => EvidenceKind::BugReport,
+            Self::GameArtifacts => EvidenceKind::GameArtifacts,
+        }
+    }
+}
+
+struct DynamicToolCompletion {
+    request_id: Value,
+    call_id: String,
+    tool: DynamicEvidenceTool,
+    receipt: Result<Value, String>,
+}
+
+fn dynamic_tools() -> Value {
+    json!([
+        {
+            "type": "function",
+            "name": "request_bug_report",
+            "description": "Collect ShieldBattery bug report metadata and available bounded client ZIP logs into this investigation's evidence workspace. The receipt provides the UUID, local evidence and manifest paths, file count, and cached status for repeats.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"report_id": {"type": "string", "format": "uuid"}},
+                "required": ["report_id"],
+                "additionalProperties": false,
+            },
+        },
+        {
+            "type": "function",
+            "name": "request_game_artifacts",
+            "description": "Collect the available map file, replays, flight recordings, and bounded artifact metadata for one ShieldBattery game into this investigation's evidence workspace. The receipt provides the UUID, local evidence and manifest paths, file count, and cached status for repeats.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"game_id": {"type": "string", "format": "uuid"}},
+                "required": ["game_id"],
+                "additionalProperties": false,
+            },
+        },
+    ])
+}
+
+fn parse_dynamic_tool(
+    params: &Value,
+) -> std::result::Result<(DynamicEvidenceTool, Uuid, &str), &'static str> {
+    if params.get("namespace") != Some(&Value::Null) {
+        return Err("dynamic evidence request used an unsupported namespace");
+    }
+    let tool_name = params
+        .get("tool")
+        .and_then(Value::as_str)
+        .ok_or("dynamic evidence request did not name a supported tool")?;
+    let tool = match tool_name {
+        "request_bug_report" => DynamicEvidenceTool::BugReport,
+        "request_game_artifacts" => DynamicEvidenceTool::GameArtifacts,
+        _ => return Err("dynamic evidence request named an unsupported tool"),
+    };
+    let arguments = params
+        .get("arguments")
+        .and_then(Value::as_object)
+        .ok_or("dynamic evidence request had invalid arguments")?;
+    let id = arguments
+        .get(tool.argument_name())
+        .and_then(Value::as_str)
+        .ok_or("dynamic evidence request had invalid arguments")?;
+    if arguments.len() != 1 {
+        return Err("dynamic evidence request had invalid arguments");
+    }
+    let id =
+        Uuid::parse_str(id).map_err(|_| "dynamic evidence request had an invalid identifier")?;
+    let call_id = params
+        .get("callId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty() && id.len() <= MAX_DYNAMIC_CALL_ID_BYTES)
+        .ok_or("dynamic evidence request had an invalid call identifier")?;
+    Ok((tool, id, call_id))
 }
 
 #[derive(Clone, Copy)]
@@ -190,6 +298,7 @@ pub(super) async fn run(
     conversation_id: Uuid,
     working_directory: &Path,
     prompt: &str,
+    requests: EvidenceRequests,
 ) -> Result<String> {
     let mut child = command(runner)
         .spawn()
@@ -226,7 +335,8 @@ pub(super) async fn run(
             .in_current_span(),
         ),
     );
-    let mut session = Session::new(runner, run_id, stdin, &mut frames, budget);
+    let mut session =
+        Session::new(runner, run_id, stdin, &mut frames, budget).with_evidence(requests);
     let result = session
         .investigate(conversation_id, working_directory, prompt)
         .await;
@@ -265,6 +375,10 @@ struct Session<'a, W> {
     tools: ToolActivityTracker,
     output_log: OutputLog,
     next_id: u64,
+    evidence: Option<EvidenceRequests>,
+    dynamic_jobs: JoinSet<DynamicToolCompletion>,
+    dynamic_call_ids: HashSet<String>,
+    dynamic_attempts: usize,
 }
 
 impl<'a, W: AsyncWrite + Unpin> Session<'a, W> {
@@ -285,7 +399,16 @@ impl<'a, W: AsyncWrite + Unpin> Session<'a, W> {
             tools: ToolActivityTracker::default(),
             output_log: OutputLog::default(),
             next_id: 0,
+            evidence: None,
+            dynamic_jobs: JoinSet::new(),
+            dynamic_call_ids: HashSet::new(),
+            dynamic_attempts: 0,
         }
+    }
+
+    fn with_evidence(mut self, evidence: EvidenceRequests) -> Self {
+        self.evidence = Some(evidence);
+        self
     }
 
     async fn investigate(
@@ -310,12 +433,15 @@ impl<'a, W: AsyncWrite + Unpin> Session<'a, W> {
     ) -> Result<String> {
         self.call(Method::Initialize, json!({
             "clientInfo":{"name":"adjutant","title":"Adjutant","version":env!("CARGO_PKG_VERSION")},
-            "capabilities":{"experimentalApi":false,"requestAttestation":false},
+            "capabilities":{"experimentalApi":self.evidence.is_some(),"requestAttestation":false},
         })).await?.require_success()?;
         write_frame(&mut self.stdin, &json!({"method":"initialized"})).await?;
         let mut params = json!({"cwd":cwd,"approvalPolicy":"never","sandbox":"read-only","ephemeral":true,"serviceName":"adjutant"});
         if let Some(model) = &self.runner.config.codex_model {
             params["model"] = json!(model);
+        }
+        if self.evidence.is_some() {
+            params["dynamicTools"] = dynamic_tools();
         }
         let thread = self
             .call(Method::ThreadStart, params)
@@ -370,6 +496,9 @@ impl<'a, W: AsyncWrite + Unpin> Session<'a, W> {
                 request = updates.recv() => {
                     let Some(request) = request else { bail!("Codex steering mailbox unexpectedly closed"); };
                     if !request.is_cancelled() { self.steer(request).await?; }
+                }
+                completion = self.dynamic_jobs.join_next(), if !self.dynamic_jobs.is_empty() => {
+                    self.finish_dynamic_tool(completion).await?;
                 }
             }
             if self.state.completed.is_some() {
@@ -426,6 +555,179 @@ impl<'a, W: AsyncWrite + Unpin> Session<'a, W> {
         Ok(())
     }
 
+    fn validate_dynamic_target(&mut self, params: &Value) -> Result<()> {
+        if self.state.completed.is_some() {
+            bail!("Codex app-server dynamic tool request arrived after the turn completed");
+        }
+        let thread = params
+            .get("threadId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && id.len() <= MAX_DYNAMIC_REQUEST_ID_BYTES)
+            .context("Codex app-server dynamic tool request had an invalid thread ID")?;
+        if self.state.thread_id.as_deref() != Some(thread) {
+            bail!("Codex app-server dynamic tool request targeted a different thread");
+        }
+        let turn = params
+            .get("turnId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && id.len() <= MAX_DYNAMIC_REQUEST_ID_BYTES)
+            .context("Codex app-server dynamic tool request had an invalid turn ID")?;
+        if self.state.starting_turn && self.state.turn_id.is_none() {
+            self.state.set_turn(turn)?;
+        }
+        if self.state.turn_id.as_deref() != Some(turn) {
+            bail!("Codex app-server dynamic tool request targeted a different turn");
+        }
+        Ok(())
+    }
+
+    async fn respond_dynamic_failure(&mut self, request_id: &Value, message: &str) -> Result<()> {
+        write_frame(
+            &mut self.stdin,
+            &json!({"id":request_id,"result":{"contentItems":[{"type":"inputText","text":message}],"success":false}}),
+        )
+        .await
+    }
+
+    async fn start_dynamic_tool(&mut self, request_id: &Value, params: &Value) -> Result<()> {
+        let request_id_is_valid = match request_id {
+            Value::String(id) => !id.is_empty() && id.len() <= MAX_DYNAMIC_REQUEST_ID_BYTES,
+            Value::Number(id) => id.as_i64().is_some() || id.as_u64().is_some(),
+            _ => false,
+        };
+        if !request_id_is_valid {
+            bail!("Codex app-server dynamic tool request had an invalid ID");
+        }
+        if self.state.completed.is_some() {
+            self.respond_dynamic_failure(
+                request_id,
+                "dynamic evidence request arrived after the active turn completed",
+            )
+            .await?;
+            return Ok(());
+        }
+        if let Err(error) = self.validate_dynamic_target(params) {
+            self.respond_dynamic_failure(
+                request_id,
+                "dynamic evidence request did not match the active investigation",
+            )
+            .await?;
+            return Err(error);
+        }
+        if self.dynamic_attempts >= MAX_DYNAMIC_TOOL_ATTEMPTS {
+            self.respond_dynamic_failure(request_id, "dynamic evidence request limit reached")
+                .await?;
+            return Ok(());
+        }
+        self.dynamic_attempts += 1;
+        let (tool, id, call_id) = match parse_dynamic_tool(params) {
+            Ok(call) => call,
+            Err(message) => {
+                self.respond_dynamic_failure(request_id, message).await?;
+                return Ok(());
+            }
+        };
+        if !self.dynamic_call_ids.insert(call_id.to_owned()) {
+            self.respond_dynamic_failure(
+                request_id,
+                "dynamic evidence request was already handled",
+            )
+            .await?;
+            return Ok(());
+        }
+        if self.dynamic_jobs.len() >= MAX_PENDING_DYNAMIC_TOOLS {
+            self.respond_dynamic_failure(
+                request_id,
+                "too many dynamic evidence requests are pending",
+            )
+            .await?;
+            return Ok(());
+        }
+        let Some(requests) = self.evidence.clone() else {
+            self.respond_dynamic_failure(request_id, "dynamic evidence collection is unavailable")
+                .await?;
+            return Ok(());
+        };
+        let request_id = request_id.clone();
+        let call_id = call_id.to_owned();
+        self.dynamic_jobs.spawn(async move {
+            let receipt = requests
+                .request(tool.evidence_kind(), id)
+                .await
+                .and_then(|receipt| serde_json::to_value(receipt).map_err(Into::into))
+                .map_err(|error| {
+                    truncate_utf8(&format!("{error:#}"), MAX_LOG_LINE_BYTES).to_owned()
+                });
+            DynamicToolCompletion {
+                request_id,
+                call_id,
+                tool,
+                receipt,
+            }
+        });
+        Ok(())
+    }
+
+    async fn finish_dynamic_tool(
+        &mut self,
+        completion: Option<Result<DynamicToolCompletion, tokio::task::JoinError>>,
+    ) -> Result<()> {
+        let completion = completion
+            .context("Codex dynamic evidence task set closed unexpectedly")?
+            .context("Codex dynamic evidence task failed")?;
+        let response = match completion.receipt {
+            Ok(receipt) => match self.evidence.as_ref() {
+                Some(requests) => match requests.manifest_json().await {
+                    Ok(manifest) => {
+                        if let Err(error) = self
+                            .runner
+                            .store
+                            .set_evidence_manifest(self.run_id, &manifest)
+                            .await
+                        {
+                            warn!(run_id = %self.run_id, call_id = %completion.call_id, tool = completion.tool.name(), error = %truncate_utf8(&error.to_string(), MAX_LOG_LINE_BYTES), "could not persist dynamic evidence manifest");
+                            json!({"contentItems":[{"type":"inputText","text":"dynamic evidence collection could not be recorded"}],"success":false})
+                        } else {
+                            match serde_json::to_string(&receipt) {
+                                Ok(text) if text.len() <= MAX_DYNAMIC_RECEIPT_BYTES => {
+                                    json!({"contentItems":[{"type":"inputText","text":text}],"success":true})
+                                }
+                                Ok(_) | Err(_) => {
+                                    json!({"contentItems":[{"type":"inputText","text":"dynamic evidence receipt exceeded its safe size limit"}],"success":false})
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        warn!(run_id = %self.run_id, call_id = %completion.call_id, tool = completion.tool.name(), error = %truncate_utf8(&error.to_string(), MAX_LOG_LINE_BYTES), "could not serialize dynamic evidence manifest");
+                        json!({"contentItems":[{"type":"inputText","text":"dynamic evidence collection could not be recorded"}],"success":false})
+                    }
+                },
+                None => {
+                    json!({"contentItems":[{"type":"inputText","text":"dynamic evidence collection is unavailable"}],"success":false})
+                }
+            },
+            Err(error) => {
+                warn!(run_id = %self.run_id, call_id = %completion.call_id, tool = completion.tool.name(), error = %error, "dynamic evidence collection failed");
+                self.audit(
+                    &json!({
+                        "type":"adjutant.dynamic_evidence",
+                        "outcome":"failed",
+                        "tool":completion.tool.name(),
+                        "error":error,
+                    })
+                    .to_string(),
+                )
+                .await?;
+                json!({"contentItems":[{"type":"inputText","text":error}],"success":false})
+            }
+        };
+        write_frame(
+            &mut self.stdin,
+            &json!({"id":completion.request_id,"result":response}),
+        )
+        .await
+    }
     async fn call(&mut self, method: Method, params: Value) -> Result<RpcReply> {
         self.next_id += 1;
         let id = self.next_id;
@@ -436,16 +738,19 @@ impl<'a, W: AsyncWrite + Unpin> Session<'a, W> {
             )
             .await?;
             loop {
-                let frame = self
-                    .frames
-                    .recv()
-                    .await
-                    .context("Codex app-server stdout closed during RPC")?;
-                if let Some((reply_id, reply)) = self.handle_frame(frame).await? {
-                    if reply_id != id {
-                        bail!("Codex app-server replied to an unexpected request");
+                tokio::select! {
+                    frame = self.frames.recv() => {
+                        let frame = frame.context("Codex app-server stdout closed during RPC")?;
+                        if let Some((reply_id, reply)) = self.handle_frame(frame).await? {
+                            if reply_id != id {
+                                bail!("Codex app-server replied to an unexpected request");
+                            }
+                            return Ok(reply);
+                        }
                     }
-                    return Ok(reply);
+                    completion = self.dynamic_jobs.join_next(), if !self.dynamic_jobs.is_empty() => {
+                        self.finish_dynamic_tool(completion).await?;
+                    }
                 }
             }
         })
@@ -487,7 +792,12 @@ impl<'a, W: AsyncWrite + Unpin> Session<'a, W> {
                 .as_str()
                 .context("Codex app-server method was not a string")?;
             if let Some(id) = object.get("id") {
-                self.deny_request(id, method).await?;
+                if method == "item/tool/call" {
+                    let params = object.get("params").unwrap_or(&Value::Null);
+                    self.start_dynamic_tool(id, params).await?;
+                } else {
+                    self.deny_request(id, method).await?;
+                }
             } else {
                 let params = object.get("params").unwrap_or(&Value::Null);
                 self.state.observe(method, params)?;
@@ -621,6 +931,7 @@ fn normalize(method: &str, params: &Value) -> Option<Value> {
                 "agentMessage" => "agent_message",
                 "commandExecution" => "command_execution",
                 "mcpToolCall" => "mcp_tool_call",
+                "dynamicToolCall" => "dynamic_tool_call",
                 other => other,
             });
         if let Some(item_type) = item_type {

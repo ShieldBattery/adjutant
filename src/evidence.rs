@@ -1,5 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+use std::mem;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +22,9 @@ use crate::shieldbattery::{BugReport, ShieldBatteryClient};
 
 const MAX_ARCHIVE_PATH_DEPTH: usize = 8;
 
+mod on_demand;
+pub(crate) use on_demand::{EvidenceKind, EvidenceReceipt, EvidenceRequests};
+
 #[derive(Clone, Debug)]
 pub struct Attachment {
     pub url: Url,
@@ -39,14 +43,15 @@ pub struct EvidenceRequest {
 }
 
 pub struct EvidenceWorkspace {
-    _temporary_directory: TempDir,
+    _temporary_directory: Arc<TempDir>,
     pub root: PathBuf,
     pub evidence_dir: PathBuf,
     pub manifest_json: String,
     pub report: Option<BugReport>,
+    pub(crate) requests: EvidenceRequests,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ManifestEntry {
     path: String,
     bytes: u64,
@@ -59,9 +64,32 @@ struct ExtractedArchive {
     expanded_bytes: u64,
 }
 
+struct CollectionBudget {
+    archive: ArchiveBudget,
+    games: GameBudget,
+}
+
+impl CollectionBudget {
+    fn new(config: &Config) -> Self {
+        Self {
+            archive: ArchiveBudget::new(config.max_archive_files, config.max_expanded_bytes),
+            games: GameBudget {
+                remaining_artifacts: config.max_game_artifacts,
+                remaining_bytes: config.max_game_evidence_bytes,
+            },
+        }
+    }
+}
+
+struct GameBudget {
+    remaining_artifacts: usize,
+    remaining_bytes: u64,
+}
+
 struct ArchiveBudget {
     remaining_entries: usize,
     remaining_bytes: u64,
+    directory_guard: Option<Arc<TempDir>>,
 }
 
 impl ArchiveBudget {
@@ -69,6 +97,7 @@ impl ArchiveBudget {
         Self {
             remaining_entries: max_entries,
             remaining_bytes: max_bytes,
+            directory_guard: None,
         }
     }
 
@@ -77,19 +106,20 @@ impl ArchiveBudget {
         archive_path: PathBuf,
         destination: PathBuf,
     ) -> Result<Vec<(String, u64)>> {
+        let remaining_entries = mem::take(&mut self.remaining_entries);
+        let remaining_bytes = mem::take(&mut self.remaining_bytes);
         let extracted = extract_zip(
             archive_path,
             destination,
-            self.remaining_entries,
-            self.remaining_bytes,
+            remaining_entries,
+            remaining_bytes,
+            self.directory_guard.clone(),
         )
         .await?;
-        self.remaining_entries = self
-            .remaining_entries
+        self.remaining_entries = remaining_entries
             .checked_sub(extracted.entry_count)
             .context("archive entry accounting underflow")?;
-        self.remaining_bytes = self
-            .remaining_bytes
+        self.remaining_bytes = remaining_bytes
             .checked_sub(extracted.expanded_bytes)
             .context("archive byte accounting underflow")?;
         Ok(extracted.files)
@@ -129,10 +159,12 @@ impl EvidenceCollector {
         run_id: Uuid,
         request: &EvidenceRequest,
     ) -> Result<EvidenceWorkspace> {
-        let temporary_directory = tempfile::Builder::new()
-            .prefix(&format!("adjutant-{run_id}-"))
-            .tempdir()
-            .context("failed to create evidence workspace")?;
+        let temporary_directory = Arc::new(
+            tempfile::Builder::new()
+                .prefix(&format!("adjutant-{run_id}-"))
+                .tempdir()
+                .context("failed to create evidence workspace")?,
+        );
         let root = temporary_directory.path().to_path_buf();
         let evidence_dir = root.join("evidence");
         tokio::fs::create_dir_all(&evidence_dir).await?;
@@ -146,21 +178,39 @@ impl EvidenceCollector {
         .await?;
 
         let mut manifest = Vec::new();
+        let mut initial_receipts = Vec::new();
         let mut report = None;
-        let mut archive_budget = ArchiveBudget::new(
-            self.config.max_archive_files,
-            self.config.max_expanded_bytes,
-        );
+        let mut budget = CollectionBudget::new(&self.config);
+        budget.archive.directory_guard = Some(Arc::clone(&temporary_directory));
         if let Some(report_id) = request.bug_report_id {
             let (fetched, entries) = self
-                .collect_bug_report(report_id, &root, &evidence_dir, &mut archive_budget)
+                .collect_bug_report(report_id, &root, &evidence_dir, &mut budget.archive)
                 .await?;
+            initial_receipts.push(EvidenceReceipt {
+                kind: EvidenceKind::BugReport,
+                id: report_id,
+                evidence_dir: evidence_dir.clone(),
+                manifest_path: evidence_dir.join("manifest.json"),
+                file_count: entries.len(),
+                cached: false,
+            });
             manifest.extend(entries);
             report = Some(fetched);
         }
 
         if let Some(game_id) = request.game_id {
-            manifest.extend(self.collect_game_artifacts(game_id, &evidence_dir).await?);
+            let entries = self
+                .collect_game_artifacts(game_id, &evidence_dir, &mut budget.games)
+                .await?;
+            initial_receipts.push(EvidenceReceipt {
+                kind: EvidenceKind::GameArtifacts,
+                id: game_id,
+                evidence_dir: evidence_dir.join(format!("game-{game_id}")),
+                manifest_path: evidence_dir.join("manifest.json"),
+                file_count: entries.len(),
+                cached: false,
+            });
+            manifest.extend(entries);
         }
 
         for (index, attachment) in request.attachments.iter().enumerate() {
@@ -170,7 +220,7 @@ impl EvidenceCollector {
                     attachment,
                     &root,
                     &evidence_dir,
-                    &mut archive_budget,
+                    &mut budget.archive,
                 )
                 .await?,
             );
@@ -178,12 +228,21 @@ impl EvidenceCollector {
 
         let manifest_json = serde_json::to_string_pretty(&manifest)?;
         tokio::fs::write(evidence_dir.join("manifest.json"), &manifest_json).await?;
+        budget.archive.directory_guard = None;
+        let requests = EvidenceRequests::new(
+            self.clone(),
+            Arc::clone(&temporary_directory),
+            manifest.clone(),
+            budget,
+            initial_receipts,
+        );
         Ok(EvidenceWorkspace {
             _temporary_directory: temporary_directory,
             root,
             evidence_dir,
             manifest_json,
             report,
+            requests,
         })
     }
 
@@ -206,7 +265,7 @@ impl EvidenceCollector {
             source: "ShieldBattery internal API".to_owned(),
         }];
         if report.logs_deleted {
-            bail!("ShieldBattery has already deleted the logs for report {report_id}");
+            return Ok((report, manifest));
         }
 
         let archive_path = root.join("bug-report.zip");
@@ -228,6 +287,7 @@ impl EvidenceCollector {
         &self,
         game_id: Uuid,
         evidence_dir: &Path,
+        game_budget: &mut GameBudget,
     ) -> Result<Vec<ManifestEntry>> {
         let client = self.shieldbattery.as_ref().context(
             "game artifact collection requires SHIELDBATTERY_INTERNAL_URL for the ShieldBattery internal API",
@@ -239,12 +299,16 @@ impl EvidenceCollector {
             .checked_add(artifacts.replays.len())
             .and_then(|count| count.checked_add(usize::from(artifacts.map.is_some())))
             .context("game artifact count overflow")?;
-        if artifact_count > self.config.max_game_artifacts {
+        if artifact_count > game_budget.remaining_artifacts {
             bail!(
-                "game {game_id} has {artifact_count} artifacts, over the {} artifact limit",
-                self.config.max_game_artifacts
+                "game {game_id} has {artifact_count} artifacts, over the remaining {} artifact limit",
+                game_budget.remaining_artifacts
             );
         }
+        game_budget.remaining_artifacts = game_budget
+            .remaining_artifacts
+            .checked_sub(artifact_count)
+            .context("game artifact accounting underflow")?;
 
         for replay in &artifacts.replays {
             if replay.size > self.config.max_game_artifact_bytes {
@@ -262,19 +326,14 @@ impl EvidenceCollector {
         tokio::fs::create_dir_all(&game_directory).await?;
         let metadata = serde_json::to_string_pretty(&artifacts)?;
         let metadata_bytes = u64::try_from(metadata.len())?;
-        if metadata_bytes > self.config.max_game_evidence_bytes {
-            bail!(
-                "game artifact metadata exceeds the {} byte total game evidence limit",
-                self.config.max_game_evidence_bytes
-            );
+        if metadata_bytes > game_budget.remaining_bytes {
+            bail!("game artifact metadata exceeds the remaining game evidence byte limit");
         }
-        tokio::fs::write(game_directory.join("artifacts.json"), &metadata).await?;
-
-        let mut remaining_bytes = self
-            .config
-            .max_game_evidence_bytes
+        game_budget.remaining_bytes = game_budget
+            .remaining_bytes
             .checked_sub(metadata_bytes)
             .context("game evidence byte accounting underflow")?;
+        tokio::fs::write(game_directory.join("artifacts.json"), &metadata).await?;
         let mut manifest = vec![ManifestEntry {
             path: format!("{directory_name}/artifacts.json"),
             bytes: metadata_bytes,
@@ -288,7 +347,7 @@ impl EvidenceCollector {
                 &artifacts,
                 &game_directory,
                 &directory_name,
-                &mut remaining_bytes,
+                &mut game_budget.remaining_bytes,
             )
             .await?,
         );
@@ -300,7 +359,7 @@ impl EvidenceCollector {
                 &artifacts,
                 &game_directory,
                 &directory_name,
-                &mut remaining_bytes,
+                &mut game_budget.remaining_bytes,
             )
             .await?,
         );
@@ -312,7 +371,7 @@ impl EvidenceCollector {
                 &artifacts,
                 &game_directory,
                 &directory_name,
-                &mut remaining_bytes,
+                &mut game_budget.remaining_bytes,
             )
             .await?
         {
@@ -488,10 +547,10 @@ impl EvidenceCollector {
         if bytes > *remaining_bytes {
             bail!("unavailable marker exceeds the remaining game evidence byte limit");
         }
-        tokio::fs::write(destination, MESSAGE).await?;
         *remaining_bytes = remaining_bytes
             .checked_sub(bytes)
             .context("game evidence byte accounting underflow")?;
+        tokio::fs::write(destination, MESSAGE).await?;
         Ok(ManifestEntry {
             path: manifest_path,
             bytes,
@@ -544,14 +603,19 @@ impl EvidenceCollector {
         let mut downloaded = 0_u64;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("game artifact download failed")?;
+            let chunk_bytes = u64::try_from(chunk.len())?;
             downloaded = downloaded
-                .checked_add(u64::try_from(chunk.len())?)
+                .checked_add(chunk_bytes)
                 .context("game artifact size overflow")?;
+            if chunk_bytes > *remaining_bytes {
+                *remaining_bytes = 0;
+                bail!("artifact exceeded the remaining game evidence byte limit");
+            }
+            *remaining_bytes = remaining_bytes
+                .checked_sub(chunk_bytes)
+                .context("game evidence byte accounting underflow")?;
             if downloaded > per_artifact_limit {
                 bail!("artifact exceeded the {per_artifact_limit} byte per-artifact limit");
-            }
-            if downloaded > *remaining_bytes {
-                bail!("artifact exceeded the remaining game evidence byte limit");
             }
             if let Some(hasher) = &mut hasher {
                 hasher.update(&chunk);
@@ -569,9 +633,6 @@ impl EvidenceCollector {
                 bail!("artifact SHA-256 does not match its manifest hash");
             }
         }
-        *remaining_bytes = remaining_bytes
-            .checked_sub(downloaded)
-            .context("game evidence byte accounting underflow")?;
         Ok(downloaded)
     }
 
@@ -738,8 +799,10 @@ async fn extract_zip(
     destination: PathBuf,
     max_files: usize,
     max_expanded_bytes: u64,
+    directory_guard: Option<Arc<TempDir>>,
 ) -> Result<ExtractedArchive> {
     tokio::task::spawn_blocking(move || {
+        let _directory_guard = directory_guard;
         extract_zip_blocking(&archive_path, &destination, max_files, max_expanded_bytes)
     })
     .await
@@ -876,6 +939,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_archive_extraction_keeps_the_reserved_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive_path = directory.path().join("invalid.zip");
+        std::fs::write(&archive_path, b"not a zip").unwrap();
+
+        let mut budget = ArchiveBudget::new(4, 4096);
+        assert!(
+            budget
+                .extract(archive_path, directory.path().join("out"))
+                .await
+                .is_err()
+        );
+        assert_eq!(budget.remaining_entries, 0);
+        assert_eq!(budget.remaining_bytes, 0);
+    }
+
+    #[tokio::test]
     async fn enforces_archive_limits_across_all_job_attachments() {
         let directory = tempfile::tempdir().unwrap();
         let mut paths = Vec::new();
@@ -907,7 +987,7 @@ mod tests {
         );
     }
 
-    fn test_config(internal_url: Url) -> Arc<Config> {
+    pub(super) fn test_config(internal_url: Url) -> Arc<Config> {
         Arc::new(Config {
             discord_token: "test".to_owned(),
             discord_guild_id: 1,
@@ -917,7 +997,7 @@ mod tests {
             discord_output_channel_id: 5,
             discord_mention_role_id: None,
             discord_allowed_role_ids: std::collections::HashSet::new(),
-            shieldbattery_public_url: Url::parse("https://shieldbattery.net").unwrap(),
+            shieldbattery_public_url: Url::parse("https://shieldbattery.invalid").unwrap(),
             shieldbattery_internal_url: Some(internal_url),
             codex_bin: "codex".to_owned(),
             codex_home: PathBuf::from(".codex"),
@@ -942,6 +1022,61 @@ mod tests {
             ui_base_url: None,
             run_retention_days: 1,
         })
+    }
+
+    #[tokio::test]
+    async fn keeps_bug_report_metadata_when_logs_are_deleted() {
+        let report_id = Uuid::parse_str("00000000-0000-4000-8000-000000000011").unwrap();
+        let metadata = serde_json::to_vec(&serde_json::json!({
+            "report": {
+                "id": report_id,
+                "submitterId": 7,
+                "details": "synthetic report",
+                "logsDeleted": true,
+                "createdAt": 1,
+                "resolvedAt": null,
+                "resolverId": null,
+            }
+        }))
+        .unwrap();
+        let route = format!("/internal/bug-reports/{report_id}");
+        let app = Router::new().route(
+            &route,
+            get(move || {
+                let metadata = metadata.clone();
+                async move { test_response(metadata, "application/json") }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let collector = EvidenceCollector::new(test_config(
+            Url::parse(&format!("http://{address}")).unwrap(),
+        ))
+        .unwrap();
+        let workspace = collector
+            .collect(
+                Uuid::parse_str("00000000-0000-4000-8000-000000000012").unwrap(),
+                &EvidenceRequest {
+                    author: "staff".to_owned(),
+                    text: "inspect this report".to_owned(),
+                    bug_report_id: Some(report_id),
+                    game_id: None,
+                    attachments: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            workspace.report.as_ref().map(|report| report.id),
+            Some(report_id)
+        );
+        assert!(workspace.evidence_dir.join("bug-report.json").is_file());
+        assert!(!workspace.evidence_dir.join("bug-report-logs").exists());
+        assert!(workspace.manifest_json.contains("bug-report.json"));
+        server.abort();
     }
 
     fn test_response(bytes: Vec<u8>, content_type: &'static str) -> axum::http::Response<Body> {
@@ -1016,6 +1151,7 @@ mod tests {
         let flight_route = format!("/internal/games/{game_id}/artifacts/flight-recordings/7");
         let replay_route = format!("/internal/games/{game_id}/artifacts/replays/{replay_id}");
         let map_route = format!("/internal/games/{game_id}/artifacts/map");
+        let partial_route = format!("/internal/games/{game_id}/artifacts/partial");
         let app = Router::new()
             .route(
                 &manifest_route,
@@ -1053,6 +1189,15 @@ mod tests {
                         async move { test_response(bytes, "application/octet-stream") }
                     }
                 }),
+            )
+            .route(
+                &partial_route,
+                get(|| async {
+                    Body::from_stream(futures_util::stream::iter([
+                        Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(b"abc")),
+                        Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(b"def")),
+                    ]))
+                }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1063,8 +1208,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let evidence_dir = directory.path().join("evidence");
         tokio::fs::create_dir(&evidence_dir).await.unwrap();
+        let mut game_budget = CollectionBudget::new(&collector.config).games;
         let entries = collector
-            .collect_game_artifacts(game_id, &evidence_dir)
+            .collect_game_artifacts(game_id, &evidence_dir, &mut game_budget)
             .await
             .unwrap();
 
@@ -1097,6 +1243,18 @@ mod tests {
             map_bytes,
         );
         assert!(game_directory.join("artifacts.json").is_file());
+        assert_eq!(game_budget.remaining_artifacts, 0);
+        let Err(second_game_error) = collector
+            .collect_game_artifacts(game_id, &evidence_dir, &mut game_budget)
+            .await
+        else {
+            panic!("a second game collection unexpectedly fit the shared budget");
+        };
+        assert!(
+            second_game_error
+                .to_string()
+                .contains("remaining 0 artifact limit")
+        );
 
         let replay_url = internal_url.join(&replay_route).unwrap();
         let wrong_hash = "00".repeat(32);
@@ -1114,8 +1272,12 @@ mod tests {
             .await
             .unwrap_err();
         assert!(hash_error.to_string().contains("SHA-256"));
+        assert_eq!(
+            remaining_bytes,
+            1024 - u64::try_from(replay_bytes.len()).unwrap()
+        );
 
-        let mut limited_config = (*test_config(internal_url)).clone();
+        let mut limited_config = (*test_config(internal_url.clone())).clone();
         limited_config.max_game_artifact_bytes = 1;
         limited_config.max_game_evidence_bytes = 1024;
         let limited_collector = EvidenceCollector::new(Arc::new(limited_config)).unwrap();
@@ -1153,6 +1315,31 @@ mod tests {
             .await
             .unwrap_err();
         assert!(total_error.to_string().contains("remaining game evidence"));
+
+        let partial_response = collector
+            .http
+            .get(internal_url.join(&partial_route).unwrap())
+            .send()
+            .await
+            .unwrap();
+        let mut remaining_bytes = 5;
+        let partial_error = collector
+            .download_game_response(
+                partial_response,
+                &directory.path().join("partial-failure.bin"),
+                &mut remaining_bytes,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            partial_error
+                .to_string()
+                .contains("remaining game evidence")
+        );
+        assert_eq!(remaining_bytes, 0);
         server.abort();
     }
 }

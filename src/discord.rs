@@ -94,8 +94,10 @@ impl DiscordHandler {
             return Ok(());
         }
         if bug_alert {
-            let report =
-                find_bug_report_id(&message.content, &self.config.shieldbattery_public_url);
+            let report = find_bug_report_id_in_alert(
+                &message.content,
+                &self.config.shieldbattery_public_url,
+            );
             if report.is_some() || !message.attachments.is_empty() {
                 self.submit(context, message, RunKind::BugReport, None, None)
                     .await?;
@@ -549,8 +551,11 @@ impl DiscordHandler {
         linked: Option<&RunLink>,
         acknowledgement: Option<&Message>,
     ) -> Result<()> {
-        let mut bug_report_id =
-            find_bug_report_id(&message.content, &self.config.shieldbattery_public_url);
+        let mut bug_report_id = if matches!(kind, RunKind::BugReport) {
+            find_bug_report_id_in_alert(&message.content, &self.config.shieldbattery_public_url)
+        } else {
+            find_bug_report_id_in_text(&message.content, &self.config.shieldbattery_public_url)
+        };
         if bug_report_id.is_none()
             && let Some(link) = linked
             && let Some(previous) = self.store.get_run(&link.run_id).await?
@@ -808,7 +813,7 @@ fn can_steer_message(message: &Message, linked: Option<&RunLink>, public_url: &U
         && message.attachments.is_empty()
         && !message.content.trim().is_empty()
         && find_game_id(&message.content, public_url).is_none()
-        && find_bug_report_id(&message.content, public_url).is_none()
+        && find_bug_report_id_in_text(&message.content, public_url).is_none()
 }
 
 fn directly_addressed(message: &Message, bot_id: u64, mention_role_id: Option<u64>) -> bool {
@@ -871,14 +876,44 @@ fn discord_attachments(message: &Message) -> Result<Vec<Attachment>> {
         .collect()
 }
 
-fn find_bug_report_id(content: &str, public_url: &Url) -> Option<Uuid> {
+fn find_bug_report_id_in_alert(content: &str, public_url: &Url) -> Option<Uuid> {
     let alert_url = content
         .lines()
         .rev()
         .map(str::trim)
         .find(|line| !line.is_empty())?
         .trim_matches(['<', '>']);
-    let parsed = Url::parse(alert_url).ok()?;
+    bug_report_id_from_url(alert_url, public_url)
+}
+
+fn find_bug_report_id_in_text(content: &str, public_url: &Url) -> Option<Uuid> {
+    let scheme = format!("{}://", public_url.scheme());
+    for token in content.split_whitespace() {
+        for (start, _) in token.match_indices(&scheme) {
+            let prefix = &token[..start];
+            if prefix.contains("://") || !is_bug_report_link_prefix(prefix) {
+                continue;
+            }
+            let url =
+                token[start..].trim_end_matches(['>', ')', ']', '}', '.', ',', '!', ';', ':']);
+            if let Some(id) = bug_report_id_from_url(url, public_url) {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+fn is_bug_report_link_prefix(prefix: &str) -> bool {
+    prefix.is_empty()
+        || prefix
+            .chars()
+            .all(|character| matches!(character, '<' | '(' | '[' | '{' | '\'' | '"'))
+        || prefix.ends_with("](")
+}
+
+fn bug_report_id_from_url(url: &str, public_url: &Url) -> Option<Uuid> {
+    let parsed = Url::parse(url).ok()?;
     if parsed.origin() != public_url.origin()
         || !parsed.username().is_empty()
         || parsed.password().is_some()
@@ -1045,7 +1080,7 @@ mod tests {
         message.content = format!("check game_id {}", Uuid::now_v7());
         assert!(!can_steer_message(&message, Some(&link), &public_url));
         message.content = format!(
-            "https://shieldbattery.invalid/admin/bug-reports/{}",
+            "please inspect https://shieldbattery.invalid/admin/bug-reports/{}",
             Uuid::now_v7()
         );
         assert!(!can_steer_message(&message, Some(&link), &public_url));
@@ -1126,37 +1161,79 @@ mod tests {
     }
 
     #[test]
-    fn extracts_only_complete_bug_report_ids_after_admin_path() {
-        let id = Uuid::parse_str("018e301c-3ca2-7524-9ce9-a76a1ee7a0bb").unwrap();
-        let public_url = Url::parse("https://shieldbattery.net").unwrap();
+    fn extracts_bug_report_ids_from_staff_text() {
+        let first = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let second = Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap();
+        let public_url = Url::parse("https://shieldbattery.invalid").unwrap();
+        let url = format!("https://shieldbattery.invalid/admin/bug-reports/{first}");
+
+        for content in [
+            format!("<@42> look into this please: {url}"),
+            format!("before <{url}>, after"),
+            format!("[bug report]({url})."),
+            format!("before this line\n({url})\nafter this line"),
+        ] {
+            assert_eq!(
+                find_bug_report_id_in_text(&content, &public_url),
+                Some(first)
+            );
+        }
         assert_eq!(
-            find_bug_report_id(
-                &format!("New report:\n<https://shieldbattery.net/admin/bug-reports/{id}>"),
-                &public_url
+            find_bug_report_id_in_text(
+                &format!(
+                    "first {url} then https://shieldbattery.invalid/admin/bug-reports/{second}"
+                ),
+                &public_url,
             ),
-            Some(id)
+            Some(first),
         );
-        assert_eq!(find_bug_report_id(&id.to_string(), &public_url), None);
         assert_eq!(
-            find_bug_report_id(
-                "https://shieldbattery.net/admin/bug-reports/018e301c3ca275249ce9a76a1ee7a0bb",
-                &public_url
-            ),
+            find_bug_report_id_in_text(&first.to_string(), &public_url),
             None
         );
+
+        let rejected = [
+            "https://shieldbattery.invalid/admin/bug-reports/00000000000040008000000000000001"
+                .to_owned(),
+            format!("https://evil.example/admin/bug-reports/{first}"),
+            format!("https://shieldbattery.invalid/admin/bug-reports/{first}/extra"),
+            format!("https://user@shieldbattery.invalid/admin/bug-reports/{first}"),
+            format!("https://shieldbattery.invalid/admin/bug-reports/{first}?unexpected"),
+            format!("https://shieldbattery.invalid/admin/bug-reports/{first}#fragment"),
+            format!(
+                "https://evil.example/?redirect=https://shieldbattery.invalid/admin/bug-reports/{first}"
+            ),
+        ];
+        for content in rejected {
+            assert_eq!(
+                find_bug_report_id_in_text(&content, &public_url),
+                None,
+                "unexpectedly accepted {content}",
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_bug_alert_uses_only_the_final_nonempty_line() {
+        let body_id = Uuid::parse_str("00000000-0000-4000-8000-000000000003").unwrap();
+        let final_id = Uuid::parse_str("00000000-0000-4000-8000-000000000004").unwrap();
+        let public_url = Url::parse("https://shieldbattery.invalid").unwrap();
+        let body_url = format!("https://shieldbattery.invalid/admin/bug-reports/{body_id}");
+        let final_url = format!("https://shieldbattery.invalid/admin/bug-reports/{final_id}");
+
         assert_eq!(
-            find_bug_report_id(
-                &format!("https://evil.example/admin/bug-reports/{id}"),
+            find_bug_report_id_in_alert(
+                &format!("submitted text: {body_url}\n<{final_url}>"),
                 &public_url
             ),
-            None
+            Some(final_id),
         );
         assert_eq!(
-            find_bug_report_id(
-                &format!("https://shieldbattery.net/admin/bug-reports/{id}/extra"),
+            find_bug_report_id_in_alert(
+                &format!("submitted text: {body_url}\nnot a report link"),
                 &public_url
             ),
-            None
+            None,
         );
     }
 

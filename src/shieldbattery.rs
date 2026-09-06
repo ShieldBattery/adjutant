@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 use uuid::Uuid;
 
+const MAX_BUG_REPORT_METADATA_BYTES: u64 = 256 * 1024;
 const MAX_GAME_ARTIFACT_MANIFEST_BYTES: u64 = 256 * 1024;
 
 #[derive(Clone)]
@@ -119,9 +120,30 @@ impl ShieldBatteryClient {
                 response.status()
             );
         }
-        let payload: BugReportResponse = response
-            .json()
-            .await
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_BUG_REPORT_METADATA_BYTES)
+        {
+            bail!(
+                "ShieldBattery bug report metadata exceeds the {MAX_BUG_REPORT_METADATA_BYTES} byte limit"
+            );
+        }
+        let mut bytes = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("failed to read ShieldBattery bug report metadata")?;
+            let next_length = bytes
+                .len()
+                .checked_add(chunk.len())
+                .context("ShieldBattery bug report metadata size overflow")?;
+            if u64::try_from(next_length)? > MAX_BUG_REPORT_METADATA_BYTES {
+                bail!(
+                    "ShieldBattery bug report metadata exceeds the {MAX_BUG_REPORT_METADATA_BYTES} byte limit"
+                );
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let payload: BugReportResponse = serde_json::from_slice(&bytes)
             .context("ShieldBattery returned invalid bug report metadata")?;
         if payload.report.id != report_id {
             bail!("ShieldBattery returned metadata for a different bug report");
@@ -301,6 +323,7 @@ fn is_sha256_hex(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use axum::{Router, body::Body, routing::get};
     use serde_json::json;
 
     use super::*;
@@ -332,6 +355,43 @@ mod tests {
                 download_path: format!("/internal/games/{game_id}/artifacts/map"),
             }),
         }
+    }
+
+    #[tokio::test]
+    async fn bounds_streamed_bug_report_metadata_before_deserializing() {
+        let report_id = Uuid::parse_str("00000000-0000-4000-8000-000000000021").unwrap();
+        let route = format!("/internal/bug-reports/{report_id}");
+        let oversized = vec![b' '; usize::try_from(MAX_BUG_REPORT_METADATA_BYTES).unwrap() + 1];
+        let app = Router::new().route(
+            &route,
+            get(move || {
+                let oversized = oversized.clone();
+                async move {
+                    axum::http::Response::builder()
+                        .header(axum::http::header::CONTENT_TYPE, "application/json")
+                        .body(Body::from_stream(futures_util::stream::iter([Ok::<
+                            _,
+                            std::convert::Infallible,
+                        >(
+                            axum::body::Bytes::from(oversized),
+                        )])))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client =
+            ShieldBatteryClient::new(Url::parse(&format!("http://{address}")).unwrap()).unwrap();
+        let error = client.get_report(report_id).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("bug report metadata exceeds the 262144 byte limit")
+        );
+        server.abort();
     }
 
     #[test]

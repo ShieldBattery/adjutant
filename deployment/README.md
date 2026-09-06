@@ -16,6 +16,13 @@ run. This is a sanitized deployment file, independent of an operator's personal 
 `config/codex.toml` selects the default model and MCP tool policy. The application adds the incident
 request, evidence paths, safety instructions, and required response sections through its prompt.
 
+`SHIELDBATTERY_INTERNAL_URL` is the private ShieldBattery app-server origin used for evidence
+collection. Adjutant collects recognized report/game links before a run, and Codex can request
+additional reports or game artifacts (including maps, replays, and flight recordings) by ID while
+it investigates. These tools need no extra token or exposed port. They use the same internal API
+client and cumulative collection limits, and add their files to the inspector's evidence manifest.
+An unset origin, HTTP failure, or exhausted limit is returned as a tool error in the run log.
+
 When updating an existing VM, copy `config/AGENTS.md` along with `compose.yaml` before recreating the
 service. The bind mount requires the file to exist. Keep the private Codex home free of a local
 `AGENTS.override.md`, which would take precedence over this shared guidance.
