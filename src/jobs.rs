@@ -17,7 +17,8 @@ use crate::codex::CodexRunner;
 use crate::evidence::{EvidenceCollector, EvidenceRequest};
 use crate::store::Store;
 
-const INLINE_REPORT_CHARS: usize = 1_650;
+mod report;
+
 const MAX_PROGRESS_POSTS: usize = 3;
 const PROGRESS_POST_INTERVAL: Duration = Duration::from_secs(120);
 const STATUS_ERROR: &str = "couldn't complete the diagnosis. check the run inspector for details.";
@@ -454,19 +455,16 @@ async fn send_report(
     title: &str,
     report: &str,
 ) -> anyhow::Result<serenity::all::Message> {
-    let heading = format!("## {}\n", truncate(title, 180));
-    let builder = if report.chars().count() <= INLINE_REPORT_CHARS {
-        CreateMessage::new().content(format!("{heading}{report}"))
-    } else {
-        let excerpt = truncate(report, INLINE_REPORT_CHARS);
-        CreateMessage::new()
-            .content(format!(
-                "{heading}{excerpt}\n\n_the complete diagnosis is attached._"
-            ))
-            .add_file(CreateAttachment::bytes(report.as_bytes(), "diagnosis.md"))
+    // Format only the Discord preview. The inspector, case memory, and attachment retain the
+    // original report, including details that do not fit in the compact message.
+    let preview = report::render(title, report);
+    let mut builder = CreateMessage::new().content(preview.content);
+    if preview.attach_full_report {
+        builder = builder.add_file(CreateAttachment::bytes(report.as_bytes(), "diagnosis.md"));
     }
-    .allowed_mentions(CreateAllowedMentions::new().replied_user(false))
-    .reference_message((delivery.output_channel, delivery.reply_to));
+    let builder = builder
+        .allowed_mentions(CreateAllowedMentions::new().replied_user(false))
+        .reference_message((delivery.output_channel, delivery.reply_to));
     Ok(tokio::time::timeout(
         Duration::from_secs(10),
         delivery
