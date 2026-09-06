@@ -130,7 +130,7 @@ developer endpoint. Leave it empty when using the agent-only Serve configuration
 ## 3. Pull images and authenticate Codex
 
 ```sh
-docker compose pull
+docker compose pull --policy always
 docker compose up -d source-sync tailscale adjutant-mcp datadog-mcp-proxy
 docker compose logs --tail=100 source-sync
 docker compose logs --tail=100 adjutant-mcp
@@ -138,6 +138,11 @@ docker compose logs --tail=100 datadog-mcp-proxy
 docker compose run --rm adjutant codex login --device-auth
 docker compose run --rm adjutant codex login status
 ```
+
+Application services use `pull_policy: missing`: startup and maintenance reuse cached images and
+fetch missing ones automatically. The default `:main` tag avoids Docker's documented `:latest`
+refresh exception. On an existing VM, change both application image tags in `.env` from `:latest`
+to `:main` to use this behavior. Run `docker compose pull --policy always` when you want updates.
 
 GHCR initially creates packages as private. For private packages, run
 `docker login ghcr.io --username <github-user>` first with a classic deployment token that has only
@@ -220,8 +225,8 @@ disabled on both ports. To keep MCP access local to Adjutant, set
 ## Operations
 
 - Upgrade application images: run
-  `docker compose pull && docker compose up -d --remove-orphans`. The workflow publishes `latest`,
-  branch, semantic-version, and `sha-*` tags; use matching `sha-*` tags or image digests for a
+  `docker compose pull --policy always && docker compose up -d --remove-orphans`. The workflow
+  publishes `latest`, branch, semantic-version, and `sha-*` tags; use matching `sha-*` tags or image digests for a
   controlled deployment and rollback.
 - Upgrade deployment configuration: copy the new tracked contents of `deployment/` over the VM
   directory without replacing `.env`, `adjutant.env`, `datadog-mcp.env`, `mcp.env`, or

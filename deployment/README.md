@@ -58,6 +58,7 @@ Enroll Tailscale and authenticate Codex before starting the full service:
 ```sh
 test -c /dev/net/tun
 docker compose config --quiet
+docker compose pull --policy always
 docker compose up -d source-sync
 docker compose logs --tail=100 source-sync
 docker compose up -d tailscale
@@ -68,12 +69,17 @@ docker compose up -d
 docker compose ps
 ```
 
+Application services use `pull_policy: missing`: startup and maintenance reuse cached images and
+fetch missing ones automatically. The default `:main` tag avoids Docker's documented `:latest`
+refresh exception. On an existing VM, change both application image tags in `.env` from `:latest`
+to `:main` to use this behavior. Run `docker compose pull --policy always` when you want updates.
+
 ## Updating
 
 When only the application images changed:
 
 ```sh
-docker compose pull
+docker compose pull --policy always
 docker compose up -d --remove-orphans
 docker compose ps
 ```
@@ -94,7 +100,7 @@ rsync -av --delete \
 
 Review changed `.example` files before updating. If an update introduces a service env file that
 does not exist on the VM—such as `datadog-mcp.env`—copy its example, restrict it to mode `600`, and
-fill in its required values before running `docker compose pull` or `docker compose up`.
+fill in its required values before running `docker compose pull --policy always` or `docker compose up`.
 Older deployments may remove `SHIELDBATTERY_HOST_SOURCE_PATH` from `.env`; source is now maintained
 inside the `source-repos` named volume, and the previous host checkout is unused.
 

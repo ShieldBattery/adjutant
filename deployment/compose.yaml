@@ -49,7 +49,8 @@ services:
 
   source-sync:
     image: ${ADJUTANT_IMAGE:?ADJUTANT_IMAGE must be set in .env}
-    pull_policy: always
+    # Reuse cached application images; fetch missing ones automatically.
+    pull_policy: missing
     command:
       - /usr/local/bin/adjutant-source-sync
     init: true
@@ -94,7 +95,7 @@ services:
 
   adjutant-mcp:
     image: ${ADJUTANT_MCP_IMAGE:?ADJUTANT_MCP_IMAGE must be set in .env}
-    pull_policy: always
+    pull_policy: missing
     init: true
     restart: unless-stopped
     network_mode: service:tailscale
@@ -167,7 +168,7 @@ services:
 
   adjutant:
     image: ${ADJUTANT_IMAGE:?ADJUTANT_IMAGE must be set in .env}
-    pull_policy: always
+    pull_policy: missing
     init: true
     restart: unless-stopped
     network_mode: service:tailscale
