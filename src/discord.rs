@@ -605,7 +605,7 @@ impl DiscordHandler {
             ),
         );
         let request_text = if message_text.trim().is_empty() {
-            "Inspect the attached evidence and diagnose the reported problem.".to_owned()
+            "Review the supplied evidence and address the staff request.".to_owned()
         } else {
             message_text.trim().to_owned()
         };
@@ -712,6 +712,7 @@ impl DiscordHandler {
         };
         let job = DiagnosticJob {
             run_id: run.id,
+            kind,
             conversation_id,
             title,
             request: evidence,
@@ -1174,7 +1175,7 @@ fn title_for(kind: RunKind, bug_report_id: Option<Uuid>, content: &str) -> Strin
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
-        .unwrap_or("Staff diagnostic request");
+        .unwrap_or("Staff request");
     let label = match kind {
         RunKind::BugReport => "Bug report",
         RunKind::StaffRequest => "Staff request",
@@ -1184,9 +1185,7 @@ fn title_for(kind: RunKind, bug_report_id: Option<Uuid>, content: &str) -> Strin
 
 fn initial_status(run_id: Uuid, source_url: &str, run_url: Option<&Url>) -> String {
     let inspector = run_url.map_or_else(String::new, |url| format!(" · [inspect run]({url})"));
-    format!(
-        "⏳ **Adjutant**: queued for diagnosis.\nrun `{run_id}` · [source]({source_url}){inspector}"
-    )
+    format!("⏳ **Adjutant**: queued.\nrun `{run_id}` · [source]({source_url}){inspector}")
 }
 
 fn truncate(value: &str, max_chars: usize) -> String {

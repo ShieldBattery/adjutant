@@ -8,13 +8,15 @@ checkouts. Compose uses the fixed project name `adjutant`, so replacing or movin
 continues to use the existing `adjutant-data`, `codex-home`, `source-repos`, and `tailscale-state`
 volumes.
 
-## Diagnostic guidance
+## Task guidance
 
 `config/AGENTS.md` defines Adjutant's voice, investigation habits, and subagent delegation guidance.
 Compose mounts it read-only as `AGENTS.md` in the runtime `CODEX_HOME`; Codex loads it for each new
 run. This is a sanitized deployment file, independent of an operator's personal Codex guidance.
-`config/codex.toml` selects the default model and MCP tool policy. The application adds the incident
-request, evidence paths, safety instructions, and required response sections through its prompt.
+`config/codex.toml` selects the default model and MCP tool policy. The application adds the
+request, evidence paths, safety instructions, and response guidance through its prompt. Staff tasks
+include data lookups, comparisons, summaries, and diagnoses. Automatic bug-report alerts retain
+explicit diagnostic guidance; other questions use only the relevant reads and response sections.
 
 `SHIELDBATTERY_INTERNAL_URL` is the private ShieldBattery app-server origin used for evidence
 collection. Adjutant collects recognized report/game links before a run, and Codex can request

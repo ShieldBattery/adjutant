@@ -15,17 +15,18 @@ use uuid::Uuid;
 
 use crate::codex::CodexRunner;
 use crate::evidence::{EvidenceCollector, EvidenceRequest};
-use crate::store::Store;
+use crate::store::{RunKind, Store};
 
 mod report;
 
 const MAX_PROGRESS_POSTS: usize = 3;
 const PROGRESS_POST_INTERVAL: Duration = Duration::from_secs(120);
-const STATUS_ERROR: &str = "couldn't complete the diagnosis. check the run inspector for details.";
+const STATUS_ERROR: &str = "couldn't complete the request. check the run inspector for details.";
 
 pub struct DiagnosticJob {
     pub run_id: Uuid,
     pub conversation_id: Uuid,
+    pub kind: RunKind,
     pub title: String,
     pub request: EvidenceRequest,
     pub delivery: DiscordDelivery,
@@ -66,8 +67,8 @@ pub enum EnqueueError {
 impl fmt::Display for EnqueueError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Full => formatter.write_str("the diagnostic queue is full"),
-            Self::Closed => formatter.write_str("the diagnostic queue is shutting down"),
+            Self::Full => formatter.write_str("the request queue is full"),
+            Self::Closed => formatter.write_str("the request queue is shutting down"),
         }
     }
 }
@@ -208,13 +209,13 @@ async fn cancel_job(job: DiagnosticJob, store: &Store) {
     if let Err(error) = store.fail_run(job.run_id, reason).await {
         error!(run_id = %job.run_id, %error, "failed to mark a queued run as stopped");
     }
-    let notice = "this queued investigation was cancelled because Adjutant is shutting down.";
+    let notice = "this queued request was cancelled because Adjutant is shutting down.";
     let _ = tokio::join!(
         update_status(
             &job.delivery,
             job.run_id,
             "⏹️",
-            "stopped before diagnosis started because Adjutant is shutting down.",
+            "stopped before the request started because Adjutant is shutting down.",
         ),
         send_notice(
             &job.delivery,
@@ -240,13 +241,7 @@ async fn process(
         fail_job(&job.delivery, store, run_id, job.conversation_id, &error).await;
         return;
     }
-    update_status(
-        &job.delivery,
-        run_id,
-        "🔎",
-        "collecting evidence and diagnosing…",
-    )
-    .await;
+    update_status(&job.delivery, run_id, "🔎", "looking into it…").await;
 
     let investigation = tokio::time::timeout(job_timeout, async {
         let workspace = collector.collect(run_id, &job.request).await?;
@@ -283,7 +278,7 @@ async fn process(
             job.conversation_id
         );
         runner
-            .run(run_id, job.conversation_id, &request, &workspace)
+            .run(run_id, job.conversation_id, job.kind, &request, &workspace)
             .await
     });
     tokio::pin!(investigation);
@@ -333,7 +328,7 @@ async fn process(
             {
                 warn!(%run_id, %error, "could not save investigation memory");
             }
-            update_status(&job.delivery, run_id, "✅", "done. diagnosis complete.").await;
+            update_status(&job.delivery, run_id, "✅", "done.").await;
             match send_report(&job.delivery, &report).await {
                 Ok(message) => {
                     let _ = store
@@ -347,15 +342,14 @@ async fn process(
                         .await;
                 }
                 Err(error) => {
-                    warn!(%run_id, %error, "diagnosis succeeded but Discord delivery failed");
-                    let notice =
-                        "couldn't post the diagnosis here. check the run inspector for the result.";
+                    warn!(%run_id, %error, "request completed but Discord delivery failed");
+                    let notice = "finished, but couldn't post the result. check the run inspector.";
                     let _ = tokio::join!(
                         update_status(
                             &job.delivery,
                             run_id,
                             "⚠️",
-                            "diagnosis complete, but posting the report failed. check the run inspector for the result.",
+                            "finished, but couldn't post the result. check the run inspector.",
                         ),
                         send_notice(&job.delivery, store, run_id, job.conversation_id, notice,),
                     );
@@ -459,7 +453,7 @@ async fn send_report(
     let preview = report::render(report);
     let mut builder = CreateMessage::new().content(preview.content);
     if preview.attach_full_report {
-        builder = builder.add_file(CreateAttachment::bytes(report.as_bytes(), "diagnosis.md"));
+        builder = builder.add_file(CreateAttachment::bytes(report.as_bytes(), "result.md"));
     }
     let builder = builder
         .allowed_mentions(CreateAllowedMentions::new().replied_user(false))
@@ -543,6 +537,7 @@ mod tests {
         DiagnosticJob {
             run_id: Uuid::now_v7(),
             conversation_id,
+            kind: RunKind::StaffRequest,
             title: "test".to_owned(),
             request: EvidenceRequest {
                 author: "staff".to_owned(),

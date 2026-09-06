@@ -1,4 +1,4 @@
-//! A bounded, readable Discord preview for diagnostic reports.
+//! A bounded, readable Discord preview for reports.
 
 use std::fmt::Write as _;
 
@@ -59,11 +59,11 @@ pub(super) fn render(report: &str) -> DiscordReport {
         }
     }
     if content.is_empty() {
-        content.push_str("no diagnostic details were returned.");
+        content.push_str("no result details were returned.");
         attach_full_report = !report.trim().is_empty();
     }
     if attach_full_report {
-        content.push_str("\n\n_the complete diagnosis is attached._");
+        content.push_str("\n\n_the complete result is attached._");
     }
     debug_assert!(content.encode_utf16().count() < 2_000);
     DiscordReport {
@@ -149,7 +149,7 @@ fn detail_preview(parsed: &ParsedReport) -> String {
         ("confidence", &parsed.confidence),
         ("evidence", &parsed.evidence),
         ("likely cause", &parsed.likely_cause),
-        ("other diagnostic details", &parsed.other),
+        ("other details", &parsed.other),
     ] {
         let value = value.trim();
         if !value.is_empty() {
@@ -273,7 +273,7 @@ mod tests {
         assert!(
             rendered
                 .content
-                .contains("\u{2026}\n\n_the complete diagnosis is attached._")
+                .contains("\u{2026}\n\n_the complete result is attached._")
         );
     }
 
@@ -353,7 +353,7 @@ mod tests {
         assert!(
             rendered
                 .content
-                .starts_with("no diagnostic details were returned.")
+                .starts_with("no result details were returned.")
         );
         assert!(rendered.attach_full_report);
     }

@@ -1,10 +1,10 @@
 # Adjutant
 
-Adjutant is a private Discord bot that gives ShieldBattery staff a diagnostic agent where they
-already triage reports. It watches the existing bug-report alert channel, retrieves the report's
+Adjutant is a private Discord bot that helps ShieldBattery staff investigate problems and answer
+questions with read-only data. It watches the existing bug-report alert channel, retrieves the report's
 private log bundle, asks Codex to correlate that evidence with the ShieldBattery source tree and
 read-only production tools, and posts the diagnosis in a staff-only output channel. Staff can
-also send one-off questions, attach ZIP files, or include a ShieldBattery game link to collect
+also ask for data lookups, comparisons, and summaries, attach ZIP files, or include a game link to collect
 that game's retained flight recordings, replays, and map.
 
 The repository is a Rust 2024 Cargo workspace containing the bot and a separate read-only database
@@ -51,8 +51,9 @@ errors.
   Bounded recent context can expand through paginated channel history, and
   searchable case notes preserve past findings and attributed corrections. See the
   [Discord interaction guide](docs/discord-interaction.md).
-- Results lead with a short summary and next checks, followed by compact supporting details.
-  Longer reports are attached as `diagnosis.md`; the inspector retains the full report.
+- Results lead with the answer or a short summary, followed by relevant supporting details.
+  Next checks and diagnostic sections are optional. Longer results are attached as `result.md`;
+  the inspector retains the full result.
 - The container includes Mozilla's Rust `minidump-stackwalk` utility for Windows crash dumps.
 - Startup recovery marks interrupted runs failed, and old run history is pruned automatically.
 
@@ -88,7 +89,7 @@ Evidence is size-limited, game artifact paths are re-derived and integrity hashe
 are extracted without trusting archive paths, and everything is removed with the per-job temporary
 directory.
 
-This is a diagnostic system, not a remediation system. It does not edit ShieldBattery, write to
+This system performs read-only investigation and analysis, without remediation. It does not edit ShieldBattery, write to
 production data, or send messages anywhere except the configured Discord output channel.
 
 ## License

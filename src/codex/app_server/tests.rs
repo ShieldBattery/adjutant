@@ -879,8 +879,5 @@ async fn private_tool_audit_preserves_payload_while_public_activity_stays_generi
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(
-        progress.activity.as_deref(),
-        Some("finished a diagnostic check")
-    );
+    assert_eq!(progress.activity.as_deref(), Some("finished a check"));
 }

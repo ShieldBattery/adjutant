@@ -14,7 +14,7 @@ Adjutant, or an optional configured `DISCORD_MENTION_ROLE_ID` mention gets an im
 acknowledgement. That role only controls
 addressing; it does not grant access. Ordinary messages go through a short Astra routing decision,
 which can stay quiet, answer briefly, ask a clarification, report status, steer active work,
-or start an investigation.
+or start a read-only task such as a lookup, summary, comparison, or diagnosis.
 Ordinary staff chatter should remain ordinary chatter. Enable Discord's privileged Message Content
 Intent for this judgment.
 
@@ -35,13 +35,29 @@ Discord reply cannot cross channels. Separate conversations can run concurrently
 follow-ups in the same conversation queue in order. A greeting or clarification does not consume a
 diagnostic slot. All outbound messages suppress automatic user, role, and everyone mentions.
 
-Final reports start with **summary** and **next checks**, using normal-sized bold labels. The
+Final results start with the answer under **summary**, using a normal-sized bold label.
+**next checks** appears only when useful follow-up remains; a factual lookup can end with its answer. The
 Discord reply links to the original request, so the report does not repeat its title or links.
-Confidence, evidence, and likely-cause notes appear in a compact details section. Long sections
+Relevant evidence, confidence, and diagnostic cause notes can appear in a compact details section;
+these are optional and are not required for data questions. Long sections
 are shortened independently so evidence cannot crowd out the next checks; the full report is
 attached when the preview omits content. The inspector and investigation memory retain the original
 report. Important uncertainty and blockers belong in the summary. Blocked investigations should
 stay brief instead of repeating missing evidence under every heading.
+
+## Lookups and analysis
+
+Staff requests are not limited to bug diagnosis. For example, asking which game was played most
+recently and how its network latency looked starts a read-only task that can query records and
+telemetry, then return the requested facts with timestamps, units, and relevant caveats. The
+router uses the existing `investigate` action for any work requiring fresh evidence; that internal
+name does not require an incident or a troubleshooting workflow.
+
+The queued dashboard uses neutral wording such as "looking into it" and "done." Codex chooses
+only the relevant evidence sources and does not need to inspect source code, download a map, or
+collect a bug report for every question. Explicit report/game links retain their existing initial
+collection behavior; later tool use is guided by the actual request. Automatic webhook alerts
+still receive an explicit bug-diagnosis task. Long results are attached as `result.md`.
 
 ## Forwarded messages
 
