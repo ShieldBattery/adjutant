@@ -47,8 +47,8 @@ errors.
   Bounded recent context can expand through paginated channel history, and
   searchable case notes preserve past findings and attributed corrections. See the
   [Discord interaction guide](docs/discord-interaction.md).
-- Results lead with a short summary and next checks, with supporting details behind Discord
-  spoilers. Longer reports are attached as `diagnosis.md`; the inspector retains the full report.
+- Results lead with a short summary and next checks, followed by compact supporting details.
+  Longer reports are attached as `diagnosis.md`; the inspector retains the full report.
 - The container includes Mozilla's Rust `minidump-stackwalk` utility for Windows crash dumps.
 - Startup recovery marks interrupted runs failed, and old run history is pruned automatically.
 

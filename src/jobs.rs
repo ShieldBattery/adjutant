@@ -334,7 +334,7 @@ async fn process(
                 warn!(%run_id, %error, "could not save investigation memory");
             }
             update_status(&job.delivery, run_id, "✅", "done. diagnosis complete.").await;
-            match send_report(&job.delivery, &job.title, &report).await {
+            match send_report(&job.delivery, &report).await {
                 Ok(message) => {
                     let _ = store
                         .link_message(
@@ -452,12 +452,11 @@ pub async fn send_notice(
 
 async fn send_report(
     delivery: &DiscordDelivery,
-    title: &str,
     report: &str,
 ) -> anyhow::Result<serenity::all::Message> {
     // Format only the Discord preview. The inspector, case memory, and attachment retain the
     // original report, including details that do not fit in the compact message.
-    let preview = report::render(title, report);
+    let preview = report::render(report);
     let mut builder = CreateMessage::new().content(preview.content);
     if preview.attach_full_report {
         builder = builder.add_file(CreateAttachment::bytes(report.as_bytes(), "diagnosis.md"));

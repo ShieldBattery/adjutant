@@ -2,7 +2,6 @@
 
 use std::fmt::Write as _;
 
-const TITLE_LIMIT: usize = 160;
 const SUMMARY_LIMIT: usize = 500;
 const NEXT_CHECKS_LIMIT: usize = 600;
 const DETAILS_LIMIT: usize = 500;
@@ -35,38 +34,33 @@ struct ParsedReport {
 }
 
 /// Formats only the Discord preview; the caller retains and attaches the original report.
-pub(super) fn render(title: &str, report: &str) -> DiscordReport {
+pub(super) fn render(report: &str) -> DiscordReport {
     let mut parsed = parse(report);
     if !parsed.has_known_sections {
         report.trim().clone_into(&mut parsed.summary);
         parsed.other.clear();
     }
-    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
-    let title = if title.is_empty() {
-        "diagnostic report"
-    } else {
-        &title
-    };
-    let (title, _) = escaped_preview(title, TITLE_LIMIT);
-    let mut content = format!("## {title}");
+    // The Discord reply links to the request, so there is no need to echo its title or URLs.
+    let details = detail_preview(&parsed);
+    let mut content = String::new();
     let mut attach_full_report = false;
     for (heading, value, limit) in [
         ("summary", parsed.summary.trim(), SUMMARY_LIMIT),
         ("next checks", parsed.next_checks.trim(), NEXT_CHECKS_LIMIT),
+        ("details", details.as_str(), DETAILS_LIMIT),
     ] {
         if !value.is_empty() {
+            if !content.is_empty() {
+                content.push_str("\n\n");
+            }
             let (preview, attach) = public_preview(value, limit);
-            let _ = write!(content, "\n\n**{heading}**\n{preview}");
+            let _ = write!(content, "**{heading}**\n{preview}");
             attach_full_report |= attach;
         }
     }
-    let details = detail_preview(&parsed);
-    if !details.is_empty() {
-        // Escape before wrapping, with atomic escapes during truncation. Neither a code fence
-        // nor a literal pipe/backslash from evidence can consume the closing spoiler marker.
-        let (preview, truncated) = escaped_preview(&details, DETAILS_LIMIT);
-        let _ = write!(content, "\n\n**details (tap to reveal)**\n||{preview}||");
-        attach_full_report |= truncated || has_complex_markdown(&details);
+    if content.is_empty() {
+        content.push_str("no diagnostic details were returned.");
+        attach_full_report = !report.trim().is_empty();
     }
     if attach_full_report {
         content.push_str("\n\n_the complete diagnosis is attached._");
@@ -226,23 +220,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn familiar_sections_place_next_checks_before_spoiled_details() {
-        let report = "**summary**\nThe match desynced after reconnecting.\n\n**confidence**\nmedium\n\n**evidence**\n- client log ends at frame 8\n\n**likely cause**\nreconnect state was stale\n\n**recommended next checks**\n- inspect the reconnect trace";
+    fn familiar_sections_place_next_checks_before_details() {
+        let report = "**summary**\nThe match desynced after reconnecting.\n\n**confidence**\nmedium\n\n**evidence**\n- client log ends at `frame 8`\n\n**likely cause**\nreconnect state was stale\n\n**recommended next checks**\n- inspect the reconnect trace";
 
-        let rendered = render("Staff request: investigate", report);
+        let rendered = render(report);
 
         let next_checks = rendered.content.find("**next checks**").unwrap();
-        let details = rendered
-            .content
-            .find("**details (tap to reveal)**")
-            .unwrap();
-        assert!(
-            rendered
-                .content
-                .starts_with("## Staff request: investigate\n\n**summary**")
-        );
+        let details = rendered.content.find("**details**").unwrap();
+        assert!(rendered.content.starts_with("**summary**"));
         assert!(next_checks < details);
-        assert!(rendered.content.contains("||confidence: medium"));
+        assert!(rendered.content.contains("confidence: medium"));
+        assert!(rendered.content.contains("- client log ends at `frame 8`"));
+        assert!(!rendered.content.contains("||"));
         assert!(!rendered.attach_full_report);
     }
 
@@ -250,7 +239,7 @@ mod tests {
     fn headings_inside_fenced_code_do_not_split_the_summary() {
         let report = "## Summary\nObserved this output:\n```text\n## Evidence\nnot a real section\n```\n\n### Next checks\n- rerun the report";
 
-        let rendered = render("test", report);
+        let rendered = render(report);
 
         assert!(
             parse(report)
@@ -272,40 +261,40 @@ mod tests {
             "detail ".repeat(300)
         );
 
-        let rendered = render("test", &report);
+        let rendered = render(&report);
 
         assert!(
             rendered
                 .content
                 .contains("**next checks**\n- collect the replay")
         );
+        assert!(rendered.content.contains("**details**\nevidence"));
+        assert!(rendered.attach_full_report);
         assert!(
             rendered
                 .content
-                .contains("details (tap to reveal)**\n||evidence")
+                .contains("\u{2026}\n\n_the complete diagnosis is attached._")
         );
-        assert!(rendered.attach_full_report);
-        assert!(rendered.content.contains("\u{2026}||"));
     }
 
     #[test]
     fn missing_structured_sections_do_not_invent_a_diagnosis() {
-        let rendered = render("test", "evidence\n- the supplied log is incomplete");
+        let rendered = render("evidence\n- the supplied log is incomplete");
         assert_eq!(
             rendered.content,
-            "## test\n\n**details (tap to reveal)**\n||evidence: - the supplied log is incomplete||"
+            "**details**\nevidence: - the supplied log is incomplete"
         );
         assert!(!rendered.attach_full_report);
     }
 
     #[test]
-    fn complex_detail_markdown_cannot_close_the_outer_spoiler() {
+    fn complex_detail_markdown_stays_visible_and_attached() {
         let report =
             "summary\nshort\n\nevidence\n```text\n||hidden marker||\n```\n\nnext checks\n- retry";
 
-        let rendered = render("test", report);
+        let rendered = render(report);
 
-        assert_eq!(rendered.content.matches("||").count(), 2);
+        assert!(!rendered.content.contains("||"));
         assert!(rendered.content.contains(r"\|\|hidden marker\|\|"));
         assert!(rendered.content.contains(r"\`\`\`text"));
         assert!(rendered.attach_full_report);
@@ -320,7 +309,7 @@ mod tests {
             "🛰️".repeat(400),
         );
 
-        let rendered = render(&"🧪".repeat(100), &report);
+        let rendered = render(&report);
 
         assert!(rendered.content.encode_utf16().count() < 2_000);
         assert!(rendered.content.is_char_boundary(rendered.content.len()));
@@ -329,7 +318,7 @@ mod tests {
 
     #[test]
     fn unstructured_short_reports_stay_inline_without_an_attachment() {
-        let rendered = render("test", "The bug report has no diagnostic structure yet.");
+        let rendered = render("The bug report has no diagnostic structure yet.");
 
         assert!(
             rendered
@@ -341,21 +330,32 @@ mod tests {
 
     #[test]
     fn unstructured_long_reports_are_trimmed_and_attached() {
-        let rendered = render("test", &"plain report ".repeat(100));
+        let rendered = render(&"plain report ".repeat(100));
 
         assert!(rendered.content.contains("plain report"));
         assert!(rendered.attach_full_report);
     }
 
     #[test]
-    fn absent_sections_do_not_generate_empty_spoilers_or_placeholder_prose() {
-        let rendered = render("test", "## summary\nblocked\n\n## next checks\n- retry");
+    fn absent_sections_do_not_generate_empty_details_or_placeholder_prose() {
+        let rendered = render("## summary\nblocked\n\n## next checks\n- retry");
         assert_eq!(
             rendered.content,
-            "## test\n\n**summary**\nblocked\n\n**next checks**\n- retry"
+            "**summary**\nblocked\n\n**next checks**\n- retry"
         );
-        let plain = render("test", "brief answer");
-        assert_eq!(plain.content, "## test\n\n**summary**\nbrief answer");
+        let plain = render("brief answer");
+        assert_eq!(plain.content, "**summary**\nbrief answer");
+    }
+
+    #[test]
+    fn heading_only_reports_still_produce_a_sendable_message() {
+        let rendered = render("## summary\n\n## next checks");
+        assert!(
+            rendered
+                .content
+                .starts_with("no diagnostic details were returned.")
+        );
+        assert!(rendered.attach_full_report);
     }
 
     #[test]
@@ -370,14 +370,20 @@ mod tests {
     }
 
     #[test]
-    fn literal_pipes_backslashes_and_clipped_escapes_stay_inside_spoilers() {
-        for ending in ["|", "\\", "`", "||", "\\|"] {
-            let result = render("test", &format!("## evidence\nends in {ending}"));
-            assert_eq!(result.content.matches("||").count(), 2);
+    fn literal_pipes_backslashes_and_clipped_escapes_stay_visible() {
+        for (ending, expected) in [
+            ("|", "|"),
+            ("\\", r"\\"),
+            ("`", r"\`"),
+            ("||", r"\|\|"),
+            ("\\|", r"\\\|"),
+        ] {
+            let result = render(&format!("## evidence\nends in {ending}"));
+            assert!(!result.content.contains("||"));
             assert!(
                 result
                     .content
-                    .contains(&format!("{}||", escaped_preview(ending, 50).0))
+                    .contains(&format!("**details**\nevidence: ends in {expected}"))
             );
             for limit in 0..8 {
                 let (escaped, _) = escaped_preview(&ending.repeat(20), limit);
@@ -392,20 +398,15 @@ mod tests {
     }
 
     #[test]
-    fn clipped_public_code_and_multiline_titles_cannot_consume_following_sections() {
+    fn clipped_public_code_cannot_consume_following_sections() {
         let source = format!(
             "## summary\n`{}\n## next checks\n- retry\n## evidence\nsomething",
             "x".repeat(600)
         );
-        let result = render("title\n```||", &source);
-        assert!(
-            result
-                .content
-                .starts_with("## title \\`\\`\\`\\|\\|\n\n**summary**")
-        );
+        let result = render(&source);
         assert!(result.content.contains("**summary**\n\\`"));
         assert!(result.content.contains("**next checks**\n- retry"));
-        assert!(result.content.contains("||evidence: something||"));
+        assert!(result.content.contains("**details**\nevidence: something"));
         assert!(result.attach_full_report);
     }
 }

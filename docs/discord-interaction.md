@@ -35,13 +35,13 @@ Discord reply cannot cross channels. Separate conversations can run concurrently
 follow-ups in the same conversation queue in order. A greeting or clarification does not consume a
 diagnostic slot. All outbound messages suppress automatic user, role, and everyone mentions.
 
-Final reports put **summary** and **next checks** first. Confidence, evidence, and likely-cause
-notes appear in a compact spoilered details section. Long sections are shortened independently
-so evidence cannot crowd out the next checks; the full report is attached when the preview omits
-content. The inspector and investigation memory retain the original report. Important uncertainty
-and blockers belong in the visible summary. Blocked investigations should stay brief instead of
-repeating missing evidence under every heading. Discord's client spoiler setting controls whether
-the supporting details start hidden.
+Final reports start with **summary** and **next checks**, using normal-sized bold labels. The
+Discord reply links to the original request, so the report does not repeat its title or links.
+Confidence, evidence, and likely-cause notes appear in a compact details section. Long sections
+are shortened independently so evidence cannot crowd out the next checks; the full report is
+attached when the preview omits content. The inspector and investigation memory retain the original
+report. Important uncertainty and blockers belong in the summary. Blocked investigations should
+stay brief instead of repeating missing evidence under every heading.
 
 ## Updating an investigation
 
@@ -139,6 +139,5 @@ sandbox remains read-only with networking disabled. Copy the updated `config/cod
 `config/AGENTS.md` with the deployment bundle, set the two channel IDs, then recreate Adjutant.
 
 References: [Discord permissions](https://docs.discord.com/developers/topics/permissions),
-[message replies](https://docs.discord.com/developers/resources/message),
-[gateway intents](https://docs.discord.com/developers/events/gateway), and
-[spoiler tags](https://support.discord.com/hc/en-us/articles/360022320632-Spoiler-Tags).
+[message replies](https://docs.discord.com/developers/resources/message), and
+[gateway intents](https://docs.discord.com/developers/events/gateway).
