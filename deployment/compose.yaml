@@ -216,6 +216,8 @@ services:
       - /tmp:rw,noexec,nosuid,size=1g
     security_opt:
       - no-new-privileges:true
+      # Permit Bubblewrap startup while retaining the remaining Docker syscall restrictions.
+      - seccomp=./security/seccomp-adjutant.json
     stop_grace_period: 35m
     healthcheck:
       test:

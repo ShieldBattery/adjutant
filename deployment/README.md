@@ -53,7 +53,8 @@ docker login ghcr.io --username <github-user>
 
 Keep the token in Docker's credential store; do not put it in any file in this bundle.
 
-Enroll Tailscale and authenticate Codex before starting the full service:
+On Ubuntu or another AppArmor host, complete [Linux sandbox permissions](#linux-sandbox-permissions)
+before starting Adjutant. Then enroll Tailscale and authenticate Codex:
 
 ```sh
 test -c /dev/net/tun
@@ -73,6 +74,72 @@ Application services use `pull_policy: missing`: startup and maintenance reuse c
 fetch missing ones automatically. The default `:main` tag avoids Docker's documented `:latest`
 refresh exception. On an existing VM, change both application image tags in `.env` from `:latest`
 to `:main` to use this behavior. Run `docker compose pull --policy always` when you want updates.
+
+## Linux sandbox permissions
+
+The `adjutant` service uses `security/seccomp-adjutant.json` to let Bubblewrap build its command
+sandbox. It preserves Docker's syscall allowlist and adds the namespace/mount calls required by
+the pinned Codex and packaged Bubblewrap on x86-64. Other services keep Docker's default policy.
+
+On Ubuntu 24.04 and other AppArmor hosts, Docker's default AppArmor profile also blocks the mount
+setup. Install the bundled profile from this directory:
+
+```sh
+sudo apt-get update
+sudo apt-get install --yes apparmor apparmor-utils
+sudo install -D -m 0644 security/apparmor-adjutant /etc/apparmor.d/adjutant-sandbox
+sudo apparmor_parser -r -W /etc/apparmor.d/adjutant-sandbox
+```
+
+Add this line to the existing `.env` file to enable the AppArmor overlay for subsequent Compose
+commands. If `COMPOSE_FILE` already lists overlays, append `:compose.apparmor.yaml` to that list.
+
+```dotenv
+COMPOSE_FILE=compose.yaml:compose.apparmor.yaml
+```
+
+The overlay selects `adjutant-sandbox` only for Adjutant. Hosts without AppArmor, including Docker
+Desktop, use the base Compose file without this overlay. The profile permits namespace creation,
+mounts, and root switching for Bubblewrap. Capability drops, `no-new-privileges`, the read-only
+container root, and Codex's read-only/network-disabled command policy remain in effect. The
+[profile notes](security/README.md) describe the permissions and upstream provenance.
+
+For an existing deployment, copy the new `security/` directory and `compose.apparmor.yaml` along
+with `compose.yaml`, load the profile, and enable the overlay before recreating Adjutant. Reload
+the profile with the same install/parser commands whenever that file changes. After pulling the
+updated image, recreate only the application service and verify it:
+
+```sh
+docker compose up -d --no-deps --force-recreate adjutant
+docker compose exec --user 10001:10001 adjutant cat /proc/self/attr/current
+```
+
+On AppArmor hosts, the last command should print `adjutant-sandbox (enforce)`. Then run the command
+sandbox check below. Loading the profile does not disable Ubuntu's global namespace restrictions.
+
+## Check the command sandbox
+
+After installing or updating the image, verify command execution separately from Codex login:
+
+```sh
+docker compose run --rm --no-deps adjutant \
+  node /usr/local/lib/adjutant/check-codex-sandbox.mjs
+```
+
+The check runs as Adjutant's UID 10001. It uses an isolated temporary Codex home, a file fixture,
+and its own loopback listener. It makes no model request and reads no production data or login
+state. Success means sandboxed reads and diagnostic utilities work, file writes are rejected, and
+the sandbox cannot connect to the listener that is reachable outside it. Temporary files are
+removed afterward. Run this check on the deployment host; a successful image build or Codex login
+does not prove that the host permits the Linux sandbox to start.
+
+The image includes the distribution's `bubblewrap` package. A missing-helper warning in an older
+image means Codex is trying its bundled helper. A later `No permissions to create a new namespace`
+error is a separate blocker: Docker seccomp or AppArmor can deny namespace creation even when
+`kernel.unprivileged_userns_clone` is `1`. Database MCP calls can still succeed in that state, so a
+completed run may have been unable to inspect local source files. Keep Codex's read-only and
+network-disabled command sandbox enabled; the parent container has private runtime volumes and
+shares the Tailscale network. See the [Codex sandbox prerequisites](https://developers.openai.com/codex/concepts/sandboxing#prerequisites).
 
 ## Codex logs and conversation failures
 

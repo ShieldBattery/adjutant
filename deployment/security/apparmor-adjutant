@@ -1,0 +1,75 @@
+# SPDX-FileCopyrightText: Copyright The Moby Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Adjutant's Docker AppArmor profile.
+#
+# Derived from Moby's docker-default template:
+# https://github.com/moby/profiles/blob/61eaf32614c7c71b60bd8927d3e6a4ffc8ff1f31/apparmor/template.go
+#
+# It deliberately retains Moby's process, procfs, sysfs, AF_ALG, and AF_VSOCK
+# restrictions. ABI 4 and explicit Unix socket access retain the older network
+# allowance. The three added setup permissions let Codex's packaged bubblewrap
+# helper construct its private sandbox:
+# user namespace creation, mount operations, and pivot_root.
+#
+# AppArmor cannot distinguish bubblewrap's temporary mount namespace from the
+# outer container by process label. `mount,` is therefore intentionally broad.
+# Docker's seccomp policy, the container's dropped capabilities, and
+# no-new-privileges still prevent an outer-container process from mounting.
+# Inside bubblewrap's newly created user namespace, the mounts only shape the
+# sandboxed command's private filesystem view.
+
+abi <abi/4.0>,
+
+include <tunables/global>
+
+profile adjutant-sandbox flags=(attach_disconnected,mediate_deleted) {
+  # Moby's base abstraction supplies standard runtime file access rules.
+  include <abstractions/base>
+  network,
+  # With ABI 4, `network,` does not imply Unix sockets.
+  unix,
+  # Disallow AF_ALG (Linux kernel crypto API); see https://copy.fail/
+  deny network alg,
+  # Disallow AF_VSOCK to prevent host/guest communication.
+  deny network vsock,
+  capability,
+  file,
+  umount,
+
+  # Host (privileged) processes and the runtime may stop the container.
+  signal (receive) peer=unconfined,
+  signal (receive) peer=runc,
+  signal (receive) peer=crun,
+  # Processes in this container may signal one another under this profile.
+  signal (send,receive) peer=adjutant-sandbox,
+
+  deny @{PROC}/* w,
+  # Deny writes to files outside /proc/<pid>/** and /proc/sys/**.
+  deny @{PROC}/{[^1-9/],[^1-9/][^0-9/],[^1-9s/][^0-9y/][^0-9s/],[^1-9/][^0-9/][^0-9/][^0-9/]*}/** w,
+  # Deny writes to /proc/sys, except the kernel shm subtree.
+  deny @{PROC}/sys/[^k]** w,
+  deny @{PROC}/sys/kernel/{?,??,[^s][^h][^m]**} w,
+  deny @{PROC}/sysrq-trigger rwklx,
+  deny @{PROC}/kcore rwklx,
+
+  # Required for Codex's read-only bubblewrap sandbox. Ubuntu 24.04 otherwise
+  # rejects user namespace creation when apparmor_restrict_unprivileged_userns=1.
+  userns,
+  # Bubblewrap builds bind, remount-ro, proc, dev, and tmpfs mounts before it
+  # pivots into its private mount namespace. See the limitation above.
+  mount,
+  pivot_root,
+
+  deny /sys/[^f]*/** wklx,
+  deny /sys/f[^s]*/** wklx,
+  deny /sys/fs/[^c]*/** wklx,
+  deny /sys/fs/c[^g]*/** wklx,
+  deny /sys/fs/cg[^r]*/** wklx,
+  deny /sys/firmware/** rwklx,
+  deny /sys/devices/virtual/powercap/** rwklx,
+  deny /sys/kernel/security/** rwklx,
+
+  # Permit same-profile tracing only when other LSM and Yama policies do.
+  ptrace (trace,tracedby,read,readby) peer=adjutant-sandbox,
+}

@@ -24,7 +24,7 @@ ENV CODEX_HOME=/var/lib/adjutant/codex \
     NPM_CONFIG_UPDATE_NOTIFIER=false
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates file git jq ripgrep util-linux \
+    && apt-get install --yes --no-install-recommends bubblewrap ca-certificates file git jq ripgrep util-linux \
     && npm install --global "@openai/codex@${CODEX_VERSION}" \
     && npm cache clean --force \
     && rm -rf /var/lib/apt/lists/* \
@@ -36,6 +36,7 @@ RUN apt-get update \
 COPY --from=builder /build/target/release/adjutant /usr/local/bin/adjutant
 COPY --from=builder /build/target/release/adjutant-source-sync /usr/local/bin/adjutant-source-sync
 COPY --from=builder /opt/minidump/bin/minidump-stackwalk /usr/local/bin/minidump-stackwalk
+COPY deployment/check-codex-sandbox.mjs /usr/local/lib/adjutant/check-codex-sandbox.mjs
 
 WORKDIR /workspace/shieldbattery
 EXPOSE 8080

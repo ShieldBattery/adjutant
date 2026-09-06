@@ -202,6 +202,9 @@ networking to model-generated commands, which is a required boundary because the
 shares the sidecar's Tailnet connection. Do not configure a custom network-enabled Codex permission
 profile for this deployment.
 
+Before starting, run the [command sandbox check](../deployment/README.md#check-the-command-sandbox)
+on the VM. Codex login and MCP health checks do not exercise local command sandbox startup.
+
 ## 5. Start and privately expose the UI
 
 ```sh

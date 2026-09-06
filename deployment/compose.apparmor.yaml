@@ -1,0 +1,6 @@
+# On AppArmor hosts, install security/apparmor-adjutant first, then enable this overlay in .env:
+# COMPOSE_FILE=compose.yaml:compose.apparmor.yaml
+services:
+  adjutant:
+    security_opt:
+      - apparmor=adjutant-sandbox
