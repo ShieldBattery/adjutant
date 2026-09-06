@@ -68,10 +68,26 @@ internal URL is empty, a request naming a bug report or game fails, while attach
 still work. Tailscale ACLs are the authorization boundary, and there is no second application
 bearer token.
 
-In the Tailscale admin console, enable MagicDNS and HTTPS, then generate a pre-authorized auth key
-for this long-lived node and put it in `tailscale.env`. Prefer a tagged node such as
-`tag:adjutant`; define its tag owner first and put `--advertise-tags=tag:adjutant` in
-`TS_EXTRA_ARGS`. Tailnet policy should allow staff to reach this node on port 443, allow only
+In the Tailscale admin console, enable MagicDNS and HTTPS. Prefer a tagged node such as
+`tag:adjutant`. In **Access controls**, merge this entry into the policy's `tagOwners` section
+(create the section if it is absent):
+
+```json
+"tagOwners": {
+  "tag:adjutant": ["autogroup:admin"]
+}
+```
+
+Save the policy, then generate an auth key with **Tags: tag:adjutant**, **Ephemeral: off**, and
+**Pre-approved: on** if device approval is enabled. Put the key in `tailscale.env` as `TS_AUTHKEY`.
+The key assigns its tag on first login. If `TS_EXTRA_ARGS` also contains
+`--advertise-tags=tag:adjutant`, that tag must be permitted by the key. An error such as
+`requested tags [tag:adjutant] are invalid or not permitted` means the tag definition or credential
+authorization needs correcting. After editing the env file, recreate the container with
+`docker compose up -d --force-recreate --wait tailscale` to load the new values.
+
+See [Tailscale's tag documentation](https://tailscale.com/docs/features/tags) for tag ownership and
+auth key requirements. Tailnet policy should allow staff to reach this node on port 443, allow only
 approved staff/developers to reach its database MCP on port 8443, and allow this node to reach only
 ShieldBattery's private app-server/database ports. The VM's ordinary egress policy must also allow
 DNS and TCP 443 to the selected Datadog managed MCP hostname, `api.github.com`, and `github.com`.
@@ -84,11 +100,17 @@ Create the database role and curated views described in [the database MCP guide]
 The MCP container is the only service that receives `mcp.env`; Codex and the Discord bot never see
 the database password.
 
-Bring up the sidecar first:
+The sidecar needs writable `/run` for both its LocalAPI socket and the firewall's
+`/run/xtables.lock`. Compose supplies a temporary filesystem there while keeping the root
+filesystem read-only. If an older bundle reports `can't open lock file /run/xtables.lock:
+Read-only file system`, update `compose.yaml` and recreate the Tailscale service. Keep the
+`tailscale-state` named volume, which stores the node's identity.
+
+Bring up the sidecar and wait for it to become healthy before starting dependent services:
 
 ```sh
 test -c /dev/net/tun
-docker compose up -d tailscale
+docker compose up -d --wait tailscale
 docker compose logs --tail=100 tailscale
 docker compose exec tailscale tailscale status
 docker compose exec tailscale tailscale serve status

@@ -31,7 +31,8 @@ services:
     pids_limit: 128
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=16m
-      - /var/run/tailscale:rw,noexec,nosuid,size=4m
+      # iptables needs /run/xtables.lock; /var/run also resolves to /run in this image.
+      - /run:rw,noexec,nosuid,size=4m,mode=0755
     security_opt:
       - no-new-privileges:true
     healthcheck:
