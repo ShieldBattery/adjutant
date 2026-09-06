@@ -18,7 +18,9 @@ use crate::evidence::{EvidenceCollector, EvidenceRequest};
 use crate::store::Store;
 
 const INLINE_REPORT_CHARS: usize = 1_650;
-const STATUS_ERROR: &str = "Diagnosis failed. Open the run inspector for details.";
+const MAX_PROGRESS_POSTS: usize = 3;
+const PROGRESS_POST_INTERVAL: Duration = Duration::from_secs(120);
+const STATUS_ERROR: &str = "couldn't complete the diagnosis. check the run inspector for details.";
 
 pub struct DiagnosticJob {
     pub run_id: Uuid,
@@ -28,6 +30,7 @@ pub struct DiagnosticJob {
     pub delivery: DiscordDelivery,
 }
 
+#[derive(Clone)]
 pub struct DiscordDelivery {
     pub http: Arc<Http>,
     pub output_channel: ChannelId,
@@ -148,6 +151,7 @@ async fn run(
             tasks.spawn(async move {
                 use futures_util::FutureExt as _;
                 let run_id = job.run_id;
+                let delivery = job.delivery.clone();
                 if std::panic::AssertUnwindSafe(process(
                     job,
                     &job_store,
@@ -160,9 +164,8 @@ async fn run(
                 .is_err()
                 {
                     error!(%run_id, "diagnostic job panicked");
-                    let _ = job_store
-                        .fail_run(run_id, "Diagnostic job stopped unexpectedly")
-                        .await;
+                    let panic_error = anyhow::anyhow!("diagnostic job stopped unexpectedly");
+                    fail_job(&delivery, &job_store, run_id, conversation_id, &panic_error).await;
                 }
                 conversation_id
             });
@@ -204,13 +207,22 @@ async fn cancel_job(job: DiagnosticJob, store: &Store) {
     if let Err(error) = store.fail_run(job.run_id, reason).await {
         error!(run_id = %job.run_id, %error, "failed to mark a queued run as stopped");
     }
-    update_status(
-        &job.delivery,
-        job.run_id,
-        "⏹️",
-        "Stopped before diagnosis started because Adjutant is shutting down.",
-    )
-    .await;
+    let notice = "this queued investigation was cancelled because Adjutant is shutting down.";
+    let _ = tokio::join!(
+        update_status(
+            &job.delivery,
+            job.run_id,
+            "⏹️",
+            "stopped before diagnosis started because Adjutant is shutting down.",
+        ),
+        send_notice(
+            &job.delivery,
+            store,
+            job.run_id,
+            job.conversation_id,
+            notice,
+        ),
+    );
 }
 
 #[allow(clippy::too_many_lines)] // Keep the diagnostic lifetime and terminal transitions together.
@@ -224,14 +236,14 @@ async fn process(
     let run_id = job.run_id;
     info!(%run_id, title = %job.title, "starting diagnostic job");
     if let Err(error) = store.mark_running(run_id).await {
-        fail_job(&job.delivery, store, run_id, &error).await;
+        fail_job(&job.delivery, store, run_id, job.conversation_id, &error).await;
         return;
     }
     update_status(
         &job.delivery,
         run_id,
         "🔎",
-        "Collecting evidence and diagnosing…",
+        "collecting evidence and diagnosing…",
     )
     .await;
 
@@ -274,40 +286,23 @@ async fn process(
     tokio::pin!(investigation);
     let mut progress_tick = tokio::time::interval(Duration::from_secs(10));
     progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut last_note = String::new();
-    let mut last_post = tokio::time::Instant::now();
+    let mut progress_policy = ProgressPostPolicy::default();
+    let mut last_post_attempt = tokio::time::Instant::now();
     let progress_updates = async {
         loop {
             progress_tick.tick().await;
             if let Ok(Some(progress)) = store.get_progress(run_id).await
                 && let Some(note) = progress.note
-                && note != last_note
             {
-                update_status(&job.delivery, run_id, "🔎", &note).await;
-                if last_post.elapsed() >= Duration::from_secs(120) {
-                    let builder = CreateMessage::new()
-                        .content(truncate(&note, 1_200))
-                        .reference_message((job.delivery.output_channel, job.delivery.reply_to))
-                        .allowed_mentions(CreateAllowedMentions::new().replied_user(false));
-                    if let Ok(message) = job
-                        .delivery
-                        .output_channel
-                        .send_message(&job.delivery.http, builder)
-                        .await
-                    {
-                        let _ = store
-                            .link_message(
-                                run_id,
-                                job.conversation_id,
-                                job.delivery.guild_id,
-                                message.channel_id.get(),
-                                message.id.get(),
-                            )
-                            .await;
-                    }
-                    last_post = tokio::time::Instant::now();
+                if progress_policy.observe(&note) {
+                    update_status(&job.delivery, run_id, "🔎", &note).await;
                 }
-                last_note = note;
+                if let Some(note) = progress_policy.take_pending(last_post_attempt.elapsed()) {
+                    last_post_attempt = tokio::time::Instant::now();
+                    if send_notice(&job.delivery, store, run_id, job.conversation_id, &note).await {
+                        progress_policy.mark_posted(note);
+                    }
+                }
             }
         }
     };
@@ -320,7 +315,7 @@ async fn process(
     match result {
         Ok(report) => {
             if let Err(error) = store.complete_run(run_id, &report).await {
-                fail_job(&job.delivery, store, run_id, &error).await;
+                fail_job(&job.delivery, store, run_id, job.conversation_id, &error).await;
                 return;
             }
             if let Err(error) = store
@@ -335,7 +330,7 @@ async fn process(
             {
                 warn!(%run_id, %error, "could not save investigation memory");
             }
-            update_status(&job.delivery, run_id, "✅", "Diagnosis complete.").await;
+            update_status(&job.delivery, run_id, "✅", "done. diagnosis complete.").await;
             match send_report(&job.delivery, &job.title, &report).await {
                 Ok(message) => {
                     let _ = store
@@ -350,27 +345,46 @@ async fn process(
                 }
                 Err(error) => {
                     warn!(%run_id, %error, "diagnosis succeeded but Discord delivery failed");
-                    update_status(&job.delivery, run_id, "⚠️", "Diagnosis complete, but posting the report failed. Open the run inspector for the result.").await;
+                    let notice =
+                        "couldn't post the diagnosis here. check the run inspector for the result.";
+                    let _ = tokio::join!(
+                        update_status(
+                            &job.delivery,
+                            run_id,
+                            "⚠️",
+                            "diagnosis complete, but posting the report failed. check the run inspector for the result.",
+                        ),
+                        send_notice(&job.delivery, store, run_id, job.conversation_id, notice,),
+                    );
                 }
             }
         }
-        Err(error) => fail_job(&job.delivery, store, run_id, &error).await,
+        Err(error) => fail_job(&job.delivery, store, run_id, job.conversation_id, &error).await,
     }
 }
 
-async fn fail_job(delivery: &DiscordDelivery, store: &Store, run_id: Uuid, error: &anyhow::Error) {
+async fn fail_job(
+    delivery: &DiscordDelivery,
+    store: &Store,
+    run_id: Uuid,
+    conversation_id: Uuid,
+    error: &anyhow::Error,
+) {
     error!(%run_id, error = ?error, "diagnostic job failed");
     if let Err(store_error) = store.fail_run(run_id, &format!("{error:#}")).await {
         error!(%run_id, %store_error, "failed to persist diagnostic failure");
     }
-    update_status(delivery, run_id, "❌", STATUS_ERROR).await;
+    let _ = tokio::join!(
+        update_status(delivery, run_id, "❌", STATUS_ERROR),
+        send_notice(delivery, store, run_id, conversation_id, STATUS_ERROR),
+    );
 }
 
-async fn update_status(delivery: &DiscordDelivery, run_id: Uuid, marker: &str, status: &str) {
+pub async fn update_status(delivery: &DiscordDelivery, run_id: Uuid, marker: &str, status: &str) {
     let content = status_text(delivery, run_id, marker, status);
     let builder = EditMessage::new()
         .content(content)
-        .allowed_mentions(CreateAllowedMentions::new());
+        .allowed_mentions(CreateAllowedMentions::new().replied_user(false));
     if let Err(error) = tokio::time::timeout(Duration::from_secs(10), async {
         delivery
             .output_channel
@@ -385,6 +399,54 @@ async fn update_status(delivery: &DiscordDelivery, run_id: Uuid, marker: &str, s
     }
 }
 
+pub async fn send_notice(
+    delivery: &DiscordDelivery,
+    store: &Store,
+    run_id: Uuid,
+    conversation_id: Uuid,
+    notice: &str,
+) -> bool {
+    let content = delivery.run_url.as_ref().map_or_else(
+        || notice.to_owned(),
+        |url| format!("{notice}\n[inspect run]({url})"),
+    );
+    let builder = CreateMessage::new()
+        .content(truncate(&content, 1_200))
+        .reference_message((delivery.output_channel, delivery.reply_to))
+        .allowed_mentions(CreateAllowedMentions::new().replied_user(false));
+    let message = match tokio::time::timeout(
+        Duration::from_secs(10),
+        delivery
+            .output_channel
+            .send_message(&delivery.http, builder),
+    )
+    .await
+    {
+        Ok(Ok(message)) => message,
+        Ok(Err(error)) => {
+            warn!(%run_id, %error, "failed to post Discord notice");
+            return false;
+        }
+        Err(_) => {
+            warn!(%run_id, "Discord notice timed out");
+            return false;
+        }
+    };
+    if let Err(error) = store
+        .link_message(
+            run_id,
+            conversation_id,
+            delivery.guild_id,
+            message.channel_id.get(),
+            message.id.get(),
+        )
+        .await
+    {
+        warn!(%run_id, %error, "failed to link Discord notice");
+    }
+    true
+}
+
 async fn send_report(
     delivery: &DiscordDelivery,
     title: &str,
@@ -397,19 +459,60 @@ async fn send_report(
         let excerpt = truncate(report, INLINE_REPORT_CHARS);
         CreateMessage::new()
             .content(format!(
-                "{heading}{excerpt}\n\n_The complete diagnosis is attached._"
+                "{heading}{excerpt}\n\n_the complete diagnosis is attached._"
             ))
             .add_file(CreateAttachment::bytes(report.as_bytes(), "diagnosis.md"))
     }
     .allowed_mentions(CreateAllowedMentions::new().replied_user(false))
     .reference_message((delivery.output_channel, delivery.reply_to));
     Ok(tokio::time::timeout(
-        Duration::from_secs(15),
+        Duration::from_secs(10),
         delivery
             .output_channel
             .send_message(&delivery.http, builder),
     )
     .await??)
+}
+
+#[derive(Default)]
+struct ProgressPostPolicy {
+    last_status_note: Option<String>,
+    pending_note: Option<String>,
+    last_posted_note: Option<String>,
+    attempts: usize,
+}
+
+impl ProgressPostPolicy {
+    fn observe(&mut self, note: &str) -> bool {
+        if self.last_status_note.as_deref() == Some(note) {
+            return false;
+        }
+        self.last_status_note = Some(note.to_owned());
+        self.pending_note = Some(note.to_owned());
+        true
+    }
+
+    fn take_pending(&mut self, elapsed: Duration) -> Option<String> {
+        if elapsed < PROGRESS_POST_INTERVAL || self.attempts >= MAX_PROGRESS_POSTS {
+            return None;
+        }
+        let note = self.pending_note.clone()?;
+        if self.last_posted_note.as_deref() == Some(note.as_str()) {
+            self.pending_note = None;
+            return None;
+        }
+        // A timed-out POST may already have reached Discord. Cap attempts as well as confirmed
+        // posts so retrying an uncertain delivery cannot exceed the progress-message allowance.
+        self.attempts += 1;
+        Some(note)
+    }
+
+    fn mark_posted(&mut self, note: String) {
+        if self.pending_note.as_deref() == Some(note.as_str()) {
+            self.pending_note = None;
+        }
+        self.last_posted_note = Some(note);
+    }
 }
 
 #[must_use]
@@ -419,7 +522,7 @@ pub fn status_text(delivery: &DiscordDelivery, run_id: Uuid, marker: &str, statu
         .as_ref()
         .map_or_else(String::new, |url| format!(" · [inspect run]({url})"));
     format!(
-        "{marker} **Adjutant** — {status}\nRun `{run_id}` · [source]({}){inspector}",
+        "{marker} **Adjutant**: {status}\nrun `{run_id}` · [source]({}){inspector}",
         delivery.source_url
     )
 }
@@ -515,6 +618,74 @@ mod tests {
             take_ready(&mut pending, &active).unwrap().job.run_id,
             ids[1]
         );
+    }
+
+    #[test]
+    fn pending_note_waits_for_the_initial_delay_and_survives_a_failed_send() {
+        let mut policy = ProgressPostPolicy::default();
+        assert!(policy.observe("checking logs"));
+        assert_eq!(
+            policy
+                .take_pending(
+                    PROGRESS_POST_INTERVAL
+                        .checked_sub(Duration::from_secs(1))
+                        .unwrap()
+                )
+                .as_deref(),
+            None
+        );
+        assert_eq!(
+            policy.take_pending(PROGRESS_POST_INTERVAL).as_deref(),
+            Some("checking logs")
+        );
+        assert_eq!(
+            policy.take_pending(PROGRESS_POST_INTERVAL).as_deref(),
+            Some("checking logs")
+        );
+    }
+
+    #[test]
+    fn latest_progress_note_coalesces_earlier_pending_notes() {
+        let mut policy = ProgressPostPolicy::default();
+        assert!(policy.observe("checking logs"));
+        assert!(policy.observe("checking the replay"));
+        assert_eq!(
+            policy.take_pending(PROGRESS_POST_INTERVAL).as_deref(),
+            Some("checking the replay")
+        );
+    }
+
+    #[test]
+    fn previously_posted_note_is_not_posted_again() {
+        let mut policy = ProgressPostPolicy::default();
+        assert!(policy.observe("checking logs"));
+        let note = policy.take_pending(PROGRESS_POST_INTERVAL).unwrap();
+        policy.mark_posted(note);
+        assert!(policy.observe("checking the replay"));
+        assert!(policy.observe("checking logs"));
+        assert_eq!(policy.take_pending(PROGRESS_POST_INTERVAL), None);
+    }
+
+    #[test]
+    fn failed_progress_attempts_also_consume_the_message_allowance() {
+        let mut policy = ProgressPostPolicy::default();
+        policy.observe("checking logs");
+        for _ in 0..MAX_PROGRESS_POSTS {
+            assert!(policy.take_pending(PROGRESS_POST_INTERVAL).is_some());
+        }
+        assert!(policy.take_pending(PROGRESS_POST_INTERVAL).is_none());
+    }
+
+    #[test]
+    fn standalone_progress_posts_stop_after_three() {
+        let mut policy = ProgressPostPolicy::default();
+        for note in ["one", "two", "three"] {
+            assert!(policy.observe(note));
+            let posted = policy.take_pending(PROGRESS_POST_INTERVAL).unwrap();
+            policy.mark_posted(posted);
+        }
+        assert!(policy.observe("four"));
+        assert_eq!(policy.take_pending(PROGRESS_POST_INTERVAL), None);
     }
 
     #[test]

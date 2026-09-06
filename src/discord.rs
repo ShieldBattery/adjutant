@@ -6,8 +6,8 @@ use anyhow::{Context as _, Result};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::json;
 use serenity::all::{
-    ChannelId, Context, CreateAllowedMentions, CreateMessage, EditMessage, EventHandler,
-    GatewayIntents, GuildId, Message, MessageId, MessageUpdateEvent, Ready,
+    ChannelId, Context, CreateAllowedMentions, CreateMessage, EventHandler, GatewayIntents,
+    GuildId, Message, MessageId, MessageUpdateEvent, Ready,
 };
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::codex::{CodexRunner, ConversationAction};
 use crate::config::Config;
 use crate::evidence::{Attachment, EvidenceRequest};
-use crate::jobs::{DiagnosticJob, DiscordDelivery, JobQueue};
+use crate::jobs::{DiagnosticJob, DiscordDelivery, JobQueue, send_notice, update_status};
 use crate::store::{NewRun, RunKind, RunLink, StaffMessage, Store};
 
 const BUG_REPORT_PATH: &str = "/admin/bug-reports/";
@@ -108,21 +108,30 @@ impl DiscordHandler {
         let question = without_mention(&message.content, self.bot_id.load(Ordering::Relaxed));
         if addressed && is_status_question(&question) {
             let response = self.status_response(linked.as_ref(), "").await?;
-            let sent = self.respond(context, message, None, &response).await?;
+            let sent = self.respond(context, message, &response).await?;
             self.link_response(message, &sent, linked.as_ref()).await?;
             return Ok(());
         }
         let acknowledgement = if addressed {
-            Some(
-                self.respond(context, message, None, "I saw your message—taking a look.")
-                    .await?,
-            )
+            let acknowledgement = self
+                .respond(context, message, "got your message, taking a look.")
+                .await?;
+            self.link_response(message, &acknowledgement, linked.as_ref())
+                .await?;
+            Some(acknowledgement)
         } else {
             None
         };
         let Ok(_permit) = Arc::clone(&self.conversations).try_acquire_owned() else {
             if addressed {
-                self.respond(context, message, acknowledgement.as_ref(), "I'm handling other requests right now. Please try again shortly; I haven't started an investigation for this message.").await?;
+                let sent = self
+                    .respond(
+                        context,
+                        message,
+                        "i'm handling other requests right now. try again shortly; i haven't started an investigation for this message.",
+                    )
+                    .await?;
+                self.link_response(message, &sent, linked.as_ref()).await?;
             }
             return Ok(());
         };
@@ -130,17 +139,32 @@ impl DiscordHandler {
         let decision_result = tokio::select! {
             biased;
             () = self.shutdown.cancelled() => {
-                if addressed { let _ = self.respond(context, message, acknowledgement.as_ref(), "Adjutant is shutting down; no investigation was started for this message.").await; }
+                if addressed
+                    && let Ok(sent) = self.respond(
+                        context,
+                        message,
+                        "Adjutant is shutting down; no investigation was started for this message.",
+                    ).await
+                {
+                    let _ = self.link_response(message, &sent, linked.as_ref()).await;
+                }
                 return Ok(());
             }
-            result = self.runner.converse(&decision_context, addressed) => result,
+            result = self.runner.converse(message.id.get(), &decision_context, addressed) => result,
         };
         let decision = match decision_result {
             Ok(decision) => decision,
             Err(error) => {
                 warn!(message_id = message.id.get(), %error, "conversational routing failed");
                 if addressed {
-                    self.respond(context, message, acknowledgement.as_ref(), "I couldn't process that request. Please try again; no investigation was started.").await?;
+                    let sent = self
+                        .respond(
+                            context,
+                            message,
+                            "i couldn't process that request. try again; no investigation was started.",
+                        )
+                        .await?;
+                    self.link_response(message, &sent, linked.as_ref()).await?;
                 }
                 return Ok(());
             }
@@ -160,13 +184,10 @@ impl DiscordHandler {
         match decision.action {
             ConversationAction::Ignore => {
                 if addressed {
-                    self.respond(
-                        context,
-                        message,
-                        acknowledgement.as_ref(),
-                        "What would you like me to check?",
-                    )
-                    .await?;
+                    let sent = self
+                        .respond(context, message, "what would you like me to check?")
+                        .await?;
+                    self.link_response(message, &sent, linked.as_ref()).await?;
                 }
             }
             ConversationAction::Investigate => {
@@ -183,24 +204,27 @@ impl DiscordHandler {
                 let response = self
                     .status_response(linked.as_ref(), &decision.query)
                     .await?;
-                let sent = self
-                    .respond(context, message, acknowledgement.as_ref(), &response)
-                    .await?;
+                let sent = self.respond(context, message, &response).await?;
                 self.link_response(message, &sent, linked.as_ref()).await?;
             }
             ConversationAction::Remember | ConversationAction::Reply => {
                 if matches!(decision.action, ConversationAction::Remember) && linked.is_none() {
-                    self.respond(context, message, acknowledgement.as_ref(), "Please reply to the investigation this finding belongs to so I can keep the correction linked to its evidence.").await?;
+                    let sent = self
+                        .respond(
+                            context,
+                            message,
+                            "please reply to the investigation this finding belongs to so i can keep the correction linked to its evidence.",
+                        )
+                        .await?;
+                    self.link_response(message, &sent, linked.as_ref()).await?;
                     return Ok(());
                 }
                 let response = if decision.reply.trim().is_empty() {
-                    "What would you like me to check?"
+                    "what would you like me to check?"
                 } else {
                     &decision.reply
                 };
-                let sent = self
-                    .respond(context, message, acknowledgement.as_ref(), response)
-                    .await?;
+                let sent = self.respond(context, message, response).await?;
                 self.link_response(message, &sent, linked.as_ref()).await?;
             }
         }
@@ -292,21 +316,21 @@ impl DiscordHandler {
                     .await?;
                 if let Some(case) = cases.first() {
                     return Ok(format!(
-                        "**{}** — historical investigation. The detailed run record has expired; the case note is retained.\n\n{}\n\n[Original request]({})",
+                        "**{}**: historical investigation. the detailed run record has expired; the case note is retained.\n\n{}\n\n[original request]({})",
                         truncate(&case.title, 100),
                         truncate(&case.summary, 1_300),
                         case.source_url
                     ));
                 }
             }
-            return Ok("There are no matching active investigations. Reply to an earlier investigation to ask about that one.".to_owned());
+            return Ok("there are no matching active investigations. reply to an earlier investigation to ask about that one.".to_owned());
         }
         let mut parts = Vec::new();
         for run in runs {
-            let mut part = format!("**{}** — {}", truncate(&run.title, 100), run.status);
+            let mut part = format!("**{}**: {}", truncate(&run.title, 100), run.status);
             if let Some(progress) = self.store.get_progress(Uuid::parse_str(&run.id)?).await? {
                 if let Some(note) = progress.note {
-                    let _ = write!(part, "\nLast progress note: {}", truncate(&note, 450));
+                    let _ = write!(part, "\nlast progress note: {}", truncate(&note, 450));
                     if let Some(updated) = progress.note_updated_at_ms {
                         let _ = write!(part, " (reported <t:{}:R>)", updated / 1000);
                     }
@@ -316,18 +340,18 @@ impl DiscordHandler {
                 {
                     let _ = write!(
                         part,
-                        "\nLast observed activity: {}",
+                        "\nlast observed activity: {}",
                         truncate(&activity, 150)
                     );
                     if let Some(updated) = progress.activity_updated_at_ms {
                         let _ = write!(part, " (<t:{}:R>)", updated / 1000);
                     }
                 }
-                let _ = write!(part, "\nUpdated <t:{}:R>.", progress.updated_at_ms / 1000);
+                let _ = write!(part, "\nupdated <t:{}:R>.", progress.updated_at_ms / 1000);
             }
             let _ = write!(
                 part,
-                "\n[Request](https://discord.com/channels/{}/{}/{})",
+                "\n[request](https://discord.com/channels/{}/{}/{})",
                 run.discord_guild_id, run.discord_channel_id, run.discord_message_id
             );
             if let Some(url) = self.run_url(Uuid::parse_str(&run.id)?) {
@@ -341,36 +365,18 @@ impl DiscordHandler {
         Ok(truncate(&parts.join("\n\n"), 1_850))
     }
 
-    async fn respond(
-        &self,
-        context: &Context,
-        source: &Message,
-        existing: Option<&Message>,
-        text: &str,
-    ) -> Result<Message> {
-        let text = truncate(text, 1_900);
-        let mentions = CreateAllowedMentions::new().replied_user(false);
-        if let Some(existing) = existing {
-            Ok(existing
-                .channel_id
-                .edit_message(
-                    &context.http,
-                    existing.id,
-                    EditMessage::new().content(text).allowed_mentions(mentions),
-                )
-                .await?)
-        } else {
-            Ok(source
-                .channel_id
-                .send_message(
-                    &context.http,
-                    CreateMessage::new()
-                        .content(text)
-                        .reference_message(source)
-                        .allowed_mentions(mentions),
-                )
-                .await?)
-        }
+    async fn respond(&self, context: &Context, source: &Message, text: &str) -> Result<Message> {
+        Ok(tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            source.channel_id.send_message(
+                &context.http,
+                CreateMessage::new()
+                    .content(truncate(text, 1_900))
+                    .reference_message(source)
+                    .allowed_mentions(CreateAllowedMentions::new().replied_user(false)),
+            ),
+        )
+        .await??)
     }
 
     async fn link_response(
@@ -457,6 +463,17 @@ impl DiscordHandler {
                 message.id.get(),
             )
             .await?;
+        if let Some(acknowledgement) = acknowledgement {
+            self.store
+                .link_message(
+                    run.id,
+                    conversation_id,
+                    self.config.discord_guild_id,
+                    acknowledgement.channel_id.get(),
+                    acknowledgement.id.get(),
+                )
+                .await?;
+        }
         let source_url = message.link();
         let run_url = self.run_url(run.id);
         // Automatic alert results live in command-center; addressed human conversations reply in place.
@@ -466,19 +483,23 @@ impl DiscordHandler {
             message.channel_id
         };
         let queued = initial_status(run.id, &source_url, run_url.as_ref());
-        let status_result = if output_channel == message.channel_id {
-            self.respond(context, message, acknowledgement, &queued)
-                .await
+        let status_result: Result<Message> = if output_channel == message.channel_id {
+            self.respond(context, message, &queued).await
         } else {
-            output_channel
-                .send_message(
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                output_channel.send_message(
                     &context.http,
                     CreateMessage::new()
                         .content(queued)
                         .allowed_mentions(CreateAllowedMentions::new().replied_user(false)),
-                )
-                .await
-                .map_err(Into::into)
+                ),
+            )
+            .await
+            {
+                Ok(result) => result.map_err(Into::into),
+                Err(error) => Err(error.into()),
+            }
         };
         let status_message = match status_result {
             Ok(status) => status,
@@ -518,21 +539,16 @@ impl DiscordHandler {
             conversation_id,
             title,
             request: evidence,
-            delivery,
+            delivery: delivery.clone(),
         };
         if let Err(error) = self.queue.try_enqueue(job) {
             self.store.fail_run(run.id, &error.to_string()).await?;
-            output_channel
-                .edit_message(
-                    &context.http,
-                    status_message.id,
-                    EditMessage::new()
-                        .content(format!(
-                            "Could not queue this investigation: {error}. Please try again later."
-                        ))
-                        .allowed_mentions(CreateAllowedMentions::new().replied_user(false)),
-                )
-                .await?;
+            let notice =
+                format!("couldn't queue this investigation: {error}. please try again later.");
+            let _ = tokio::join!(
+                update_status(&delivery, run.id, "❌", &notice),
+                send_notice(&delivery, &self.store, run.id, conversation_id, &notice,),
+            );
         }
         Ok(())
     }
@@ -821,7 +837,7 @@ fn title_for(kind: RunKind, bug_report_id: Option<Uuid>, content: &str) -> Strin
 fn initial_status(run_id: Uuid, source_url: &str, run_url: Option<&Url>) -> String {
     let inspector = run_url.map_or_else(String::new, |url| format!(" · [inspect run]({url})"));
     format!(
-        "⏳ **Adjutant** — Queued for diagnosis.\nRun `{run_id}` · [source]({source_url}){inspector}"
+        "⏳ **Adjutant**: queued for diagnosis.\nrun `{run_id}` · [source]({source_url}){inspector}"
     )
 }
 

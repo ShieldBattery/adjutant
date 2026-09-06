@@ -19,19 +19,31 @@ explicit requests get a busy response and passive messages may be skipped. A rou
 does not start an investigation. The short routing process has no shell, subagents, database,
 or Datadog tools; it can use the read-only staff context tools.
 
-Replies use Discord's native message references, never threads. Reply to the original request,
-acknowledgement, progress message, or result to keep a follow-up in the same investigation
-conversation. Separate conversations can run concurrently; diagnostic follow-ups in the same
-conversation queue in order. A greeting or clarification does not consume a diagnostic slot.
-All outbound messages suppress automatic user, role, and everyone mentions.
+Replies use Discord's native message references, never threads. An acknowledgement stays
+visible, and conversational answers, clarifications, status answers, meaningful progress, terminal
+notices, and final reports arrive as fresh replies to the original triggering staff message with
+that person's notification disabled. Starting an investigation creates a separate queued dashboard
+reply. That dashboard is the editable queued, running, latest-note, and terminal snapshot. Every
+run-associated acknowledgement, dashboard, progress notice, terminal notice, and report is linked
+to the investigation so a reply to any of them continues the same conversation. Automatic
+bug-report diagnoses post in command-center and use their dashboard as the reply target because a
+Discord reply cannot cross channels. Separate conversations can run concurrently; diagnostic
+follow-ups in the same conversation queue in order. A greeting or clarification does not consume a
+diagnostic slot. All outbound messages suppress automatic user, role, and everyone mentions.
 
 ## Progress and status
 
-The acknowledgement becomes the queued/running/completed status message. While investigating,
-Adjutant can emit public notes containing a finding, next check, or blocker. The service checks
-for changed notes every 10 seconds and edits that status. A new reply can appear at most once
-every two minutes, only when there is a new substantive note. It never generates timer-based
-"still working" messages or invented completion percentages.
+The acknowledgement remains visible while a separate dashboard tracks queued, running, latest
+note, and terminal state. While investigating, Adjutant can emit a public reply containing a
+finding, next check, or blocker. The service checks for changed notes every 10 seconds and updates
+the dashboard. It waits 120 seconds before the first standalone progress reply, leaves at least
+120 seconds between later attempts, and makes at most three standalone progress-post attempts per
+run. It coalesces pending changes into the latest note. A failed send leaves the pending note
+available for a later attempt within that allowance. Timed-out sends count toward the cap because
+Discord may already have received the message. It never generates timer-based "still working" messages or invented
+completion percentages. Successful reports are the only completion reply; failures, cancellations,
+queue rejection, panic recovery, and report-delivery failure each update the dashboard and attempt
+one concise terminal reply.
 
 Mention Adjutant with `status?` or reply to its investigation with `any updates?` for an immediate
 status lookup that bypasses model routing. More specific natural-language questions can use the

@@ -74,6 +74,37 @@ fetch missing ones automatically. The default `:main` tag avoids Docker's docume
 refresh exception. On an existing VM, change both application image tags in `.env` from `:latest`
 to `:main` to use this behavior. Run `docker compose pull --policy always` when you want updates.
 
+## Codex logs and conversation failures
+
+Follow application and Codex lifecycle/error logs with:
+
+```sh
+docker compose logs --follow --tail=100 adjutant
+```
+
+Conversation logs include the Discord `message_id`, decision, and elapsed time. A failure before
+an investigation starts is logged here even though no inspector run exists. Investigation logs
+carry a `run_id`; the inspector retains detailed events, messages, commands, and tool output.
+Codex JSON error events are also logged, including failures that do not appear on stderr.
+
+For more detail, set this in `adjutant.env` and recreate the service:
+
+```dotenv
+RUST_LOG=adjutant=info,adjutant::codex=debug
+```
+
+```sh
+docker compose up -d --no-deps --force-recreate adjutant
+```
+
+Debug logging adds Codex stderr and item event types. It does not mirror model messages, reasoning
+summaries, commands, or tool arguments/results into Docker logs. CLI error text and stderr may
+still contain diagnostic context, so review those logs before sharing them. Output logging is
+capped per invocation stream at 40 entries and 16 KiB of text, with at most 2 KiB per entry;
+normal completion/failure summaries remain available after that cap. Restore `RUST_LOG=adjutant=info`
+and recreate the service when finished. Configure Docker daemon log rotation separately on the VM;
+these per-invocation caps do not limit total log growth over the lifetime of a container.
+
 ## Updating
 
 When only the application images changed:
