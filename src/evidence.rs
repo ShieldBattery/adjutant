@@ -915,6 +915,7 @@ mod tests {
             discord_bug_report_webhook_id: 3,
             discord_request_channel_id: 4,
             discord_output_channel_id: 5,
+            discord_mention_role_id: None,
             discord_allowed_role_ids: std::collections::HashSet::new(),
             shieldbattery_public_url: Url::parse("https://shieldbattery.net").unwrap(),
             shieldbattery_internal_url: Some(internal_url),

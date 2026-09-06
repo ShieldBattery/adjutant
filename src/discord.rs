@@ -104,8 +104,13 @@ impl DiscordHandler {
         }
 
         let linked = self.reply_link(message).await?;
-        let addressed = directly_addressed(message, self.bot_id.load(Ordering::Relaxed));
-        let question = without_mention(&message.content, self.bot_id.load(Ordering::Relaxed));
+        let bot_id = self.bot_id.load(Ordering::Relaxed);
+        let addressed = directly_addressed(message, bot_id, self.config.discord_mention_role_id);
+        let question = without_mention(
+            &message.content,
+            bot_id,
+            self.config.discord_mention_role_id,
+        );
         if addressed && is_status_question(&question) {
             let response = self.status_response(linked.as_ref(), "").await?;
             let sent = self.respond(context, message, &response).await?;
@@ -426,7 +431,11 @@ impl DiscordHandler {
         let title = title_for(
             kind,
             bug_report_id,
-            &without_mention(&message.content, self.bot_id.load(Ordering::Relaxed)),
+            &without_mention(
+                &message.content,
+                self.bot_id.load(Ordering::Relaxed),
+                self.config.discord_mention_role_id,
+            ),
         );
         let request_text = if message.content.trim().is_empty() {
             "Inspect the attached evidence and diagnose the reported problem.".to_owned()
@@ -663,19 +672,29 @@ fn bounded_conversation_context(mut context: serde_json::Value) -> Result<String
     }
 }
 
-fn directly_addressed(message: &Message, bot_id: u64) -> bool {
-    bot_id != 0
+fn directly_addressed(message: &Message, bot_id: u64, mention_role_id: Option<u64>) -> bool {
+    (bot_id != 0
         && (message.mentions.iter().any(|user| user.id.get() == bot_id)
             || message
                 .referenced_message
                 .as_ref()
-                .is_some_and(|reply| reply.author.id.get() == bot_id))
+                .is_some_and(|reply| reply.author.id.get() == bot_id)))
+        || mention_role_id.is_some_and(|role_id| {
+            message
+                .mention_roles
+                .iter()
+                .any(|role| role.get() == role_id)
+        })
 }
-fn without_mention(text: &str, bot_id: u64) -> String {
-    text.replace(&format!("<@{bot_id}>"), "")
-        .replace(&format!("<@!{bot_id}>"), "")
-        .trim()
-        .to_owned()
+
+fn without_mention(text: &str, bot_id: u64, mention_role_id: Option<u64>) -> String {
+    let mut stripped = text
+        .replace(&format!("<@{bot_id}>"), "")
+        .replace(&format!("<@!{bot_id}>"), "");
+    if let Some(role_id) = mention_role_id {
+        stripped = stripped.replace(&format!("<@&{role_id}>"), "");
+    }
+    stripped.trim().to_owned()
 }
 fn is_status_question(text: &str) -> bool {
     matches!(
@@ -875,28 +894,56 @@ mod tests {
     fn direct_mentions_and_replies_are_attention_not_role_or_everyone_pings() {
         let mut message = Message::default();
         message.content = "Adjutant might be useful here".to_owned();
-        assert!(!directly_addressed(&message, 42));
+        assert!(!directly_addressed(&message, 42, None));
         message.mention_everyone = true;
-        assert!(!directly_addressed(&message, 42));
+        assert!(!directly_addressed(&message, 42, None));
         let mut user = serenity::all::User::default();
         user.id = serenity::all::UserId::new(42);
         message.mentions.push(user.clone());
-        assert!(directly_addressed(&message, 42));
-        assert!(!directly_addressed(&message, 0));
+        assert!(directly_addressed(&message, 42, None));
+        assert!(!directly_addressed(&message, 0, None));
         message.mentions.clear();
         let mut reference = Message::default();
         reference.author = user;
         message.referenced_message = Some(Box::new(reference));
-        assert!(directly_addressed(&message, 42));
-        assert!(!directly_addressed(&message, 43));
+        assert!(directly_addressed(&message, 42, None));
+        assert!(!directly_addressed(&message, 43, None));
+    }
+
+    #[test]
+    fn configured_role_mentions_are_attention_and_strip_for_fast_status() {
+        let mut message = Message::default();
+        message.content = "<@&77> status?".to_owned();
+        message.mention_roles.push(serenity::all::RoleId::new(77));
+        assert!(directly_addressed(&message, 0, Some(77)));
+        assert!(!directly_addressed(&message, 0, None));
+        assert_eq!(without_mention(&message.content, 0, Some(77)), "status?");
+        assert_eq!(
+            without_mention("<@&78> status?", 0, Some(77)),
+            "<@&78> status?"
+        );
+    }
+
+    #[test]
+    fn unconfigured_or_other_role_mentions_are_not_attention() {
+        let mut message = Message::default();
+        message.mention_everyone = true;
+        message.mention_roles.push(serenity::all::RoleId::new(77));
+        assert!(!directly_addressed(&message, 42, None));
+        assert!(!directly_addressed(&message, 42, Some(78)));
     }
 
     #[test]
     fn status_fast_path_does_not_consume_diagnostic_questions() {
-        assert!(is_status_question(&without_mention("<@42> status?", 42)));
+        assert!(is_status_question(&without_mention(
+            "<@42> status?",
+            42,
+            None
+        )));
         assert!(is_status_question(&without_mention(
             "<@!42> any updates?",
-            42
+            42,
+            None
         )));
         assert!(!is_status_question(
             "check the server status for yesterday's disconnect"
@@ -904,7 +951,7 @@ mod tests {
         assert!(!is_status_question(
             "status of the relay and investigate the crash"
         ));
-        assert_eq!(without_mention("<@43> status", 42), "<@43> status");
+        assert_eq!(without_mention("<@43> status", 42, None), "<@43> status");
     }
 
     #[test]

@@ -18,6 +18,7 @@ pub struct Config {
     pub discord_bug_report_webhook_id: u64,
     pub discord_request_channel_id: u64,
     pub discord_output_channel_id: u64,
+    pub discord_mention_role_id: Option<u64>,
     pub discord_allowed_role_ids: HashSet<u64>,
     pub shieldbattery_public_url: Url,
     pub shieldbattery_internal_url: Option<Url>,
@@ -92,6 +93,7 @@ impl Config {
             discord_bug_report_webhook_id: parse_required("DISCORD_BUG_REPORT_WEBHOOK_ID")?,
             discord_request_channel_id,
             discord_output_channel_id,
+            discord_mention_role_id: parse_optional_positive_u64("DISCORD_MENTION_ROLE_ID")?,
             discord_allowed_role_ids: comma_separated("DISCORD_ALLOWED_ROLE_IDS")
                 .into_iter()
                 .map(|value| {
@@ -174,6 +176,24 @@ where
     required(name)?
         .parse()
         .with_context(|| format!("{name} is invalid"))
+}
+
+fn parse_optional_positive_u64(name: &str) -> Result<Option<u64>> {
+    parse_optional_positive_u64_value(name, optional(name))
+}
+
+fn parse_optional_positive_u64_value(name: &str, value: Option<String>) -> Result<Option<u64>> {
+    value
+        .map(|value| {
+            let value = value
+                .parse()
+                .with_context(|| format!("{name} is invalid"))?;
+            if value == 0 {
+                bail!("{name} must be greater than zero");
+            }
+            Ok(value)
+        })
+        .transpose()
 }
 
 fn parse_positive_or<T>(name: &str, default: T) -> Result<T>
@@ -302,6 +322,33 @@ mod tests {
         for (alerts, requests, output) in [(1, 2, 3), (1, 1, 1), (0, 2, 2), (1, 0, 0)] {
             assert!(super::validate_staff_channels(alerts, requests, output).is_err());
         }
+    }
+
+    #[test]
+    fn parses_optional_nonzero_mention_role_id() {
+        assert_eq!(
+            parse_optional_positive_u64_value("DISCORD_MENTION_ROLE_ID", None).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_optional_positive_u64_value(
+                "DISCORD_MENTION_ROLE_ID",
+                Some("123456789012345678".to_owned()),
+            )
+            .unwrap(),
+            Some(123_456_789_012_345_678)
+        );
+        assert!(
+            parse_optional_positive_u64_value("DISCORD_MENTION_ROLE_ID", Some("0".to_owned()))
+                .is_err()
+        );
+        assert!(
+            parse_optional_positive_u64_value(
+                "DISCORD_MENTION_ROLE_ID",
+                Some("not-a-role-id".to_owned()),
+            )
+            .is_err()
+        );
     }
 
     #[test]

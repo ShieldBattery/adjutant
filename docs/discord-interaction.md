@@ -9,10 +9,12 @@ and `DISCORD_BUG_REPORT_CHANNEL_ID` to staff-alerts. Startup rejects a third out
 The configured application webhook in staff-alerts starts automatic bug-report diagnoses;
 their acknowledgements and results appear in command-center with a link to the alert.
 Other bots and webhooks never trigger a conversation. Human staff can address Adjutant in
-either channel. An explicit mention or a reply to Adjutant gets an immediate acknowledgement.
-Ordinary messages go through a short Astra routing decision: it can stay quiet, answer briefly,
-ask a clarification, report status, or start an investigation. Ordinary staff chatter should
-remain ordinary chatter. Enable Discord's privileged Message Content Intent for this judgment.
+either channel. An explicit user mention, a reply to Adjutant, or an optional configured
+`DISCORD_MENTION_ROLE_ID` mention gets an immediate acknowledgement. That role only controls
+addressing; it does not grant access. Ordinary messages go through a short Astra routing decision,
+which can stay quiet, answer briefly, ask a clarification, report status, or start an investigation.
+Ordinary staff chatter should remain ordinary chatter. Enable Discord's privileged Message Content
+Intent for this judgment.
 
 Routing has two concurrent slots and a deadline of at most 60 seconds. During saturation,
 explicit requests get a busy response and passive messages may be skipped. A routing failure
@@ -86,8 +88,10 @@ bot roles, category overrides, and channel overrides: removing a grant from one 
 remove access granted elsewhere. Deny View Channel for the bot elsewhere and allow it explicitly
 in these staff channels, checking new categories/channels as they are added. The application
 also filters guild/channel IDs before caching or routing incoming messages and validates every
-history-tool channel. Optional `DISCORD_ALLOWED_ROLE_IDS` additionally gates human requests in
-both channels; channel visibility still determines the readable staff context.
+history-tool channel. Optional `DISCORD_MENTION_ROLE_ID` makes one role mention address
+Adjutant, while `DISCORD_ALLOWED_ROLE_IDS` separately gates human requests in both channels.
+Neither setting grants channel visibility; channel permissions still determine the readable staff
+context.
 
 The staff context MCP binds only to shared loopback `127.0.0.1:8083/mcp`. It is absent from
 Tailscale Serve and has no published port. The Rust parent holds the Discord credential and
