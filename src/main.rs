@@ -75,10 +75,9 @@ async fn main() -> Result<()> {
     });
     let ui_store = store.clone();
     let ui_bind = config.ui_bind;
-    let ui_token = config.ui_token.clone();
     let ui_service_sender = service_sender.clone();
     let ui_handle = tokio::spawn(async move {
-        let result = adjutant::web::serve(ui_store, ui_bind, ui_token, async {
+        let result = adjutant::web::serve(ui_store, ui_bind, async {
             let _ = ui_shutdown_receiver.await;
         })
         .await;

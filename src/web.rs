@@ -1,4 +1,4 @@
-//! Read-only, authenticated inspection UI for Adjutant runs.
+//! Read-only inspection UI for Adjutant runs, authorized by Tailscale Serve and Tailnet policy.
 
 use std::fmt::Write as _;
 use std::future::Future;
@@ -7,106 +7,75 @@ use std::net::SocketAddr;
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::header::{
-    AUTHORIZATION, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_SECURITY_POLICY, REFERRER_POLICY,
-    WWW_AUTHENTICATE, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
+    CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_SECURITY_POLICY, REFERRER_POLICY,
+    X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
 };
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
-use base64::Engine;
-use sha2::{Digest, Sha256};
-use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use crate::config::validate_ui_bind;
 use crate::store::{RunEvent, RunRecord, Store};
 
 const RUN_LIST_LIMIT: i64 = 100;
 
-#[derive(Clone)]
-struct AppState {
-    store: Store,
-    credential_hash: [u8; 32],
-}
-
-/// Serve the authenticated, read-only Adjutant inspection UI until `shutdown` resolves.
+/// Serve the read-only Adjutant inspection UI until shutdown resolves.
 ///
-/// The caller should bind `bind` to a Tailscale address (or another private interface) when the
-/// UI is intended to be reachable from the tailnet.
+/// The listener must bind to loopback. Tailscale Serve is the only supported remote ingress;
+/// Tailnet policy authorizes access without an application password or identity-header checks.
 pub async fn serve(
     store: Store,
     bind: SocketAddr,
-    ui_token: String,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let expected = format!("adjutant:{ui_token}");
-    let state = AppState {
-        store,
-        credential_hash: sha256(expected.as_bytes()),
-    };
-    let app = Router::new()
+    let listener = tokio::net::TcpListener::bind(validate_ui_bind(bind)?).await?;
+    axum::serve(listener, router(store))
+        .with_graceful_shutdown(shutdown)
+        .await?;
+    Ok(())
+}
+
+fn router(store: Store) -> Router {
+    Router::new()
         .route("/", get(index))
         .route("/runs/{id}", get(run_detail))
         .route("/runs/{id}/events.jsonl", get(events_jsonl))
         .route("/healthz", get(healthz))
-        .with_state(state);
-    let listener = tokio::net::TcpListener::bind(bind).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await?;
-    Ok(())
+        .with_state(store)
 }
 
 async fn healthz() -> Response {
     secure_response((StatusCode::OK, "ok").into_response())
 }
 
-async fn index(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !is_authorized(&headers, &state.credential_hash) {
-        return unauthorized();
-    }
-
-    match state.store.list_runs(RUN_LIST_LIMIT).await {
+async fn index(State(store): State<Store>) -> Response {
+    match store.list_runs(RUN_LIST_LIMIT).await {
         Ok(runs) => secure_html(index_page(&runs)),
         Err(_) => internal_error(),
     }
 }
 
-async fn run_detail(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-) -> Response {
-    if !is_authorized(&headers, &state.credential_hash) {
-        return unauthorized();
-    }
-
-    let run = match state.store.get_run(&id).await {
+async fn run_detail(State(store): State<Store>, Path(id): Path<String>) -> Response {
+    let run = match store.get_run(&id).await {
         Ok(Some(run)) => run,
         Ok(None) => return not_found(),
         Err(_) => return internal_error(),
     };
-    match state.store.get_events(&id).await {
+    match store.get_events(&id).await {
         Ok(events) => secure_html(run_page(&run, &events)),
         Err(_) => internal_error(),
     }
 }
 
-async fn events_jsonl(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-) -> Response {
-    if !is_authorized(&headers, &state.credential_hash) {
-        return unauthorized();
-    }
-
-    match state.store.get_run(&id).await {
+async fn events_jsonl(State(store): State<Store>, Path(id): Path<String>) -> Response {
+    match store.get_run(&id).await {
         Ok(Some(_)) => {}
         Ok(None) => return not_found(),
         Err(_) => return internal_error(),
     }
-    match state.store.get_events(&id).await {
+    match store.get_events(&id).await {
         Ok(events) => {
             let mut jsonl = events
                 .into_iter()
@@ -129,40 +98,6 @@ async fn events_jsonl(
         }
         Err(_) => internal_error(),
     }
-}
-
-fn is_authorized(headers: &HeaderMap, expected_hash: &[u8; 32]) -> bool {
-    let credentials = headers
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(parse_basic_credentials)
-        .unwrap_or_default();
-    sha256(&credentials).ct_eq(expected_hash).into()
-}
-
-fn parse_basic_credentials(value: &str) -> Option<Vec<u8>> {
-    let mut parts = value.split_whitespace();
-    let scheme = parts.next()?;
-    let encoded = parts.next()?;
-    if !scheme.eq_ignore_ascii_case("basic") || parts.next().is_some() {
-        return None;
-    }
-    base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .ok()
-}
-
-fn sha256(bytes: &[u8]) -> [u8; 32] {
-    Sha256::digest(bytes).into()
-}
-
-fn unauthorized() -> Response {
-    let mut response = secure_response((StatusCode::UNAUTHORIZED, "Unauthorized").into_response());
-    response.headers_mut().insert(
-        WWW_AUTHENTICATE,
-        HeaderValue::from_static("Basic realm=\"Adjutant\", charset=\"UTF-8\""),
-    );
-    response
 }
 
 fn not_found() -> Response {
@@ -375,6 +310,12 @@ fn escape_html(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, header::WWW_AUTHENTICATE};
+    use tower::ServiceExt;
+
+    use crate::store::{NewRun, RunKind};
+
     use super::*;
 
     #[test]
@@ -385,15 +326,82 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parses_only_valid_basic_credentials() {
-        assert_eq!(
-            parse_basic_credentials("Basic YWRqdXRhbnQ6c2VjcmV0"),
-            Some(b"adjutant:secret".to_vec())
+    #[tokio::test]
+    async fn inspector_serves_runs_and_events_without_application_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("runs.sqlite3"))
+            .await
+            .unwrap();
+        let run = NewRun::new(
+            RunKind::StaffRequest,
+            "<script>title</script>".to_owned(),
+            "test request".to_owned(),
+            None,
+            1,
+            2,
+            3,
         );
-        assert!(parse_basic_credentials("Bearer YWRqdXRhbnQ6c2VjcmV0").is_none());
-        assert!(parse_basic_credentials("Basic not base64").is_none());
-        assert!(parse_basic_credentials("Basic YQ== extra").is_none());
+        let event = r#"{"type":"test.event","text":"<script>event</script>"}"#;
+        store.create_run(&run).await.unwrap();
+        store.append_event(run.id, event).await.unwrap();
+        store.complete_run(run.id, "test report").await.unwrap();
+        let app = router(store);
+
+        for (path, expected) in [
+            (
+                "/".to_owned(),
+                "&lt;script&gt;title&lt;/script&gt;".to_owned(),
+            ),
+            (format!("/runs/{}", run.id), "test report".to_owned()),
+            (
+                format!("/runs/{}/events.jsonl", run.id),
+                format!("{event}\n"),
+            ),
+            ("/healthz".to_owned(), "ok".to_owned()),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(&path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert!(!response.headers().contains_key(WWW_AUTHENTICATE));
+            assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+            assert_eq!(response.headers()[X_CONTENT_TYPE_OPTIONS], "nosniff");
+            assert_eq!(response.headers()[X_FRAME_OPTIONS], "DENY");
+            assert!(response.headers().contains_key(CONTENT_SECURITY_POLICY));
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let body = std::str::from_utf8(&bytes).unwrap();
+            assert!(body.contains(&expected), "{path}: {body}");
+        }
+
+        for path in ["/runs/missing", "/runs/missing/events.jsonl"] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+        let response = app
+            .oneshot(Request::post("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn serve_rejects_non_loopback_addresses() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("runs.sqlite3"))
+            .await
+            .unwrap();
+        for address in ["0.0.0.0:0", "[::]:0", "192.0.2.1:0", "100.64.0.1:0"] {
+            let error = serve(store.clone(), address.parse().unwrap(), async {})
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("must be a loopback address"));
+        }
     }
 
     #[test]

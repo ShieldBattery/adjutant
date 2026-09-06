@@ -86,18 +86,19 @@ summaries, commands, file changes attempted, MCP calls, web searches, plan event
 Codex itself emits. It does not expose private hidden chain-of-thought that the Codex interface does
 not return.
 
-The web UI is server-rendered and read-only. It requires HTTP Basic authentication and must be
-served only through Tailscale HTTPS or another TLS-terminating private proxy. `/healthz` contains no
-run data and is the only unauthenticated route.
+The web UI is server-rendered and read-only. It binds to shared loopback and is exposed only through
+Tailscale Serve on private HTTPS port 443. Tailnet ACLs and grants authorize users; the UI has no
+separate browser password, and forwarded Tailscale identity headers are not an application
+authentication mechanism. `/healthz` contains no run data and remains available for health checks.
 
 ## Production tool policy
 
 Adjutant never gives a database password or Datadog service token to the Codex child. The checked-in
 Codex configuration allowlists the isolated database MCP's five reviewed read-only tools and a
 reviewed subset of Datadog's read-only tools. Their credentials belong only to separate sidecars,
-and both production identities lack write privileges.
-`CODEX_ENV_PASSTHROUGH` is an explicit allowlist; Adjutant rejects attempts to pass its Discord or
-UI credentials into Codex.
+and both production identities lack write privileges. `CODEX_ENV_PASSTHROUGH` is an explicit
+allowlist; Adjutant rejects `DISCORD_TOKEN` and the legacy `ADJUTANT_UI_TOKEN` value. The
+latter remains denylisted for upgrades even though the current UI does not use it.
 
 ## Staff context and conversation routing
 

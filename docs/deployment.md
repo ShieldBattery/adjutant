@@ -45,15 +45,10 @@ chmod 600 .env adjutant.env datadog-mcp.env mcp.env tailscale.env
 
 Set the two GHCR image references and review the source-sync organization, interval, depth,
 retention, and size settings in `.env`. Fill in the Discord token, guild/channel IDs, exact
-bug-report webhook ID, public ShieldBattery origin, and a random UI password of at least 32 bytes
-in `adjutant.env`; put the dedicated read-only PostgreSQL URL in `mcp.env`. Put the dedicated
-read-only Datadog Service Access Token and the managed MCP hostname for your Datadog site in
-`datadog-mcp.env`. See the
-[Datadog MCP guide](datadog-mcp.md) for the exact role and token setup. For example:
-
-```sh
-openssl rand -hex 32
-```
+bug-report webhook ID, and public ShieldBattery origin in `adjutant.env`; put the dedicated
+read-only PostgreSQL URL in `mcp.env`. Put the dedicated read-only Datadog Service Access
+Token and managed MCP hostname for your Datadog site in `datadog-mcp.env`. See the
+[Datadog MCP guide](datadog-mcp.md) for the exact role and token setup.
 
 `source-sync` uses no GitHub credential. It enumerates the configured organization's public
 repositories, requires the `ShieldBattery` repository, skips other empty repositories, keeps
@@ -161,8 +156,10 @@ of Codex. Mark future mandatory MCPs as required so a diagnosis fails visibly in
 continuing without production evidence.
 
 `CODEX_ENV_PASSTHROUGH` is the only path for extra environment variables into the Codex process.
-Adjutant rejects its Discord and UI secrets even if listed. Prefer short-lived or narrowly scoped
-MCP credentials, and do not give either production identity write access. `source-sync` is the sole
+Adjutant rejects `DISCORD_TOKEN` and the legacy `ADJUTANT_UI_TOKEN` value even if listed. The latter
+remains denylisted for upgrades even though the current UI does not use it. Prefer short-lived or
+narrowly scoped MCP credentials, and do not give either production identity write access.
+`source-sync` is the sole
 writer to the source volume; the Adjutant container mounts its atomically published generations
 read-only. Codex itself is always invoked with the read-only sandbox. That sandbox also denies
 networking to model-generated commands, which is a required boundary because the parent container
@@ -178,15 +175,19 @@ docker compose logs -f source-sync tailscale adjutant-mcp datadog-mcp-proxy adju
 docker compose exec tailscale tailscale serve status
 ```
 
-Use the HTTPS `*.ts.net` URL on port 443 printed by Tailscale. The browser will request HTTP Basic
-credentials: the username is `adjutant`, and the password is `ADJUTANT_UI_TOKEN`. `/healthz` is the
-only unauthenticated endpoint. Keep a tailnet ACL around the sidecar even though the UI also
-requires the password.
+Use the HTTPS `*.ts.net` URL on port 443 printed by Tailscale. Access is authorized by the Tailnet
+ACLs and grants for this node; the browser does not prompt for a separate UI password. Forwarded
+Tailscale identity headers are not used as an independent application authentication mechanism.
+`/healthz` contains no run data and is available for health checks.
 
 The checked-in Serve configuration explicitly disables Funnel. The inspector binds only to the
 loopback interface shared with the sidecar, so port 8080 is unavailable from both the host and the
-Tailnet. Do not add a published port, enable Funnel, or put the inspector behind a public reverse
-proxy.
+Tailnet; Tailscale Serve is the only ingress on HTTPS 443. Do not add a published port, enable
+Funnel, or put the inspector behind a public reverse proxy.
+
+Images from before this authentication change still require `ADJUTANT_UI_TOKEN`; upgrade the
+application image before removing that variable from an existing deployment. Once the upgraded
+image is running, the legacy value is ignored and can be removed.
 
 The same hostname exposes the MCP to approved Tailnet developers at
 `https://<hostname>.<tailnet>.ts.net:8443/mcp`. It has no second bearer token: Tailnet identity and

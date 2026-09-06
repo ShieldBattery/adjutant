@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use url::Url;
 
+// Keep the retired UI token protected in case an older deployment still supplies it.
 const PROTECTED_CHILD_VARIABLES: &[&str] = &["ADJUTANT_UI_TOKEN", "DISCORD_TOKEN"];
 
 #[derive(Clone)]
@@ -40,7 +41,6 @@ pub struct Config {
     pub job_timeout: Duration,
     pub database_path: PathBuf,
     pub ui_bind: SocketAddr,
-    pub ui_token: String,
     pub ui_base_url: Option<Url>,
     pub run_retention_days: u64,
 }
@@ -51,10 +51,12 @@ impl Config {
             .map(|value| parse_internal_url(&value))
             .transpose()?;
 
-        let ui_token = required("ADJUTANT_UI_TOKEN")?;
-        if ui_token.len() < 32 {
-            bail!("ADJUTANT_UI_TOKEN must contain at least 32 bytes");
-        }
+        let ui_bind = validate_ui_bind(
+            optional("ADJUTANT_UI_BIND")
+                .unwrap_or_else(|| "127.0.0.1:8080".to_owned())
+                .parse()
+                .context("ADJUTANT_UI_BIND must be an IP:port socket address")?,
+        )?;
 
         let codex_env_passthrough = comma_separated("CODEX_ENV_PASSTHROUGH");
         for name in &codex_env_passthrough {
@@ -124,17 +126,20 @@ impl Config {
             job_timeout: Duration::from_secs(parse_positive_or("JOB_TIMEOUT_SECONDS", 1800)?),
             database_path: optional("ADJUTANT_DATABASE_PATH")
                 .map_or_else(|| PathBuf::from("data/adjutant.sqlite3"), PathBuf::from),
-            ui_bind: optional("ADJUTANT_UI_BIND")
-                .unwrap_or_else(|| "127.0.0.1:8080".to_owned())
-                .parse()
-                .context("ADJUTANT_UI_BIND must be an IP:port socket address")?,
-            ui_token,
+            ui_bind,
             ui_base_url: optional("ADJUTANT_UI_BASE_URL")
                 .map(|value| parse_ui_url(&value))
                 .transpose()?,
             run_retention_days: parse_positive_or("RUN_RETENTION_DAYS", 90)?,
         })
     }
+}
+
+pub(crate) fn validate_ui_bind(bind: SocketAddr) -> Result<SocketAddr> {
+    if !bind.ip().is_loopback() {
+        bail!("ADJUTANT_UI_BIND must be a loopback address; expose the UI through Tailscale Serve");
+    }
+    Ok(bind)
 }
 
 fn validate_staff_channels(alerts: u64, requests: u64, output: u64) -> Result<()> {
@@ -272,6 +277,24 @@ fn is_environment_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inspection_listener_requires_loopback() {
+        for address in ["127.0.0.1:8080", "127.0.0.2:8080", "[::1]:8080"] {
+            let bind = address.parse().unwrap();
+            assert_eq!(validate_ui_bind(bind).unwrap(), bind);
+        }
+        for address in [
+            "0.0.0.0:8080",
+            "[::]:8080",
+            "192.0.2.1:8080",
+            "192.168.1.1:8080",
+            "100.64.0.1:8080",
+            "[2001:db8::1]:8080",
+        ] {
+            assert!(validate_ui_bind(address.parse().unwrap()).is_err());
+        }
+    }
 
     #[test]
     fn enforces_exactly_two_nonzero_staff_channels() {

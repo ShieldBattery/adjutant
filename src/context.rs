@@ -940,7 +940,6 @@ mod tests {
             job_timeout: std::time::Duration::from_secs(1),
             database_path,
             ui_bind: "127.0.0.1:8080".parse().unwrap(),
-            ui_token: "x".repeat(32),
             ui_base_url: None,
             run_retention_days: 1,
         })

@@ -938,7 +938,6 @@ mod tests {
             job_timeout: Duration::from_secs(30),
             database_path: PathBuf::from("adjutant.sqlite3"),
             ui_bind: "127.0.0.1:0".parse().unwrap(),
-            ui_token: "x".repeat(32),
             ui_base_url: None,
             run_retention_days: 1,
         })

@@ -8,9 +8,9 @@ between untrusted reports, the Codex runner, production credentials, and product
 - Treat `../shieldbattery` as a read-only reference. Do not change ShieldBattery from this repo
   unless the operator explicitly reverses this decision. Describe any future application-side work
   in a handoff document instead.
-- Tailscale is the application authorization boundary for ShieldBattery's internal report API and
-  the developer-facing MCP endpoint. Do not reintroduce an internal API token or add an MCP bearer
-  token without an explicit design change.
+- Tailscale is the application authorization boundary for ShieldBattery's internal report API, the
+  inspection UI, and the developer-facing MCP endpoint. Do not introduce an internal API token,
+  UI password, or MCP bearer token without an explicit design change.
 - The normal Compose configuration exposes the database MCP to authorized Tailnet developers on
   HTTPS port 8443. `deployment/tailscale/serve-agent-only.json` is the opt-out configuration.
 - The inspection UI may show events, reasoning summaries, commands, and tool calls emitted by

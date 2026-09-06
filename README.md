@@ -22,7 +22,8 @@ errors.
   replays, map, and artifact metadata through the private internal API, up to configured limits.
 - Queue depth, concurrency, generic download size, game artifact count/per-file/aggregate bytes,
   aggregate ZIP expansion/file count, event history, process count, and end-to-end runtime are bounded.
-- Discord and inspection-UI secrets never enter the Codex child environment.
+- The Discord credential and any legacy `ADJUTANT_UI_TOKEN` value never enter the Codex child
+  environment.
 - Codex runs with `codex exec --ephemeral --json --sandbox read-only` against a read-only source
   mount and approved read-only MCPs. Its model-generated commands have no network access, even
   though the parent service shares the sidecar's Tailnet connection.
@@ -30,7 +31,8 @@ errors.
   repositories and atomically refreshes persistent, read-only snapshots without rebuilding or
   redeploying Adjutant.
 - A Tailscale sidecar gives the service private ShieldBattery egress and exposes the inspector with
-  Tailnet-only HTTPS; no application port is published on the Docker host.
+  Tailnet-only HTTPS on port 443; Tailnet ACLs and grants authorize access, with no separate browser
+  password and no application port published on the Docker host.
 - A credential-isolated Rust MCP gives Codex purpose-built user/game diagnostics plus bounded
   read-only PostgreSQL queries. Compose deploys it by default, and Tailscale Serve can also expose
   it privately to approved developers.
