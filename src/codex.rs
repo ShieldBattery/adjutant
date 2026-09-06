@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
+use tokio::process::{ChildStdin, Command};
 use tokio::task::{AbortHandle, JoinHandle};
 use tracing::{Instrument, debug, info, warn};
 use uuid::Uuid;
@@ -334,7 +334,7 @@ impl CodexRunner {
         let mut process_group = ProcessGroupGuard::new(process_id);
         let stdout = child.stdout.take().context("Codex stdout was not piped")?;
         let stderr = child.stderr.take().context("Codex stderr was not piped")?;
-        let mut stdin = child.stdin.take().context("Codex stdin was not piped")?;
+        let stdin = child.stdin.take().context("Codex stdin was not piped")?;
 
         let event_budget = Arc::new(EventBudget::new(&self.config));
         let pipe_tasks = PipeTasks::new(
@@ -359,8 +359,7 @@ impl CodexRunner {
                 .in_current_span(),
             ),
         );
-        stdin.write_all(prompt.as_bytes()).await?;
-        stdin.shutdown().await?;
+        send_prompt(stdin, &prompt).await?;
 
         let status =
             if let Ok(status) = tokio::time::timeout(self.config.job_timeout, child.wait()).await {
@@ -463,7 +462,7 @@ impl CodexRunner {
             .stderr
             .take()
             .context("conversation Codex stderr was not piped")?;
-        let mut stdin = child
+        let stdin = child
             .stdin
             .take()
             .context("conversation Codex stdin was not piped")?;
@@ -475,8 +474,7 @@ impl CodexRunner {
             ),
             tokio::spawn(drain_jsonl(BufReader::new(stderr), true, event_budget).in_current_span()),
         );
-        stdin.write_all(prompt.as_bytes()).await?;
-        stdin.shutdown().await?;
+        send_prompt(stdin, &prompt).await?;
 
         let deadline = self.config.job_timeout.min(Duration::from_secs(60));
         let status = if let Ok(status) = tokio::time::timeout(deadline, child.wait()).await {
@@ -589,6 +587,21 @@ impl CodexRunner {
         command
     }
 }
+async fn send_prompt(mut stdin: ChildStdin, prompt: &str) -> Result<()> {
+    stdin
+        .write_all(prompt.as_bytes())
+        .await
+        .context("failed to write the Codex prompt")?;
+    stdin
+        .shutdown()
+        .await
+        .context("failed to flush the Codex prompt")?;
+    // Codex reads `-` until EOF. Tokio's Unix pipe shutdown is a no-op, and child.wait()
+    // cannot close a handle we took out of the child. Drop it before waiting for any output.
+    drop(stdin);
+    Ok(())
+}
+
 fn conversation_schema() -> Value {
     json!({
         "type": "object",
@@ -1263,6 +1276,46 @@ async fn read_final_report(path: &Path) -> Result<String> {
 mod tests {
     use super::*;
     use crate::store::{NewRun, RunKind};
+
+    #[tokio::test]
+    async fn prompt_delivery_closes_stdin_before_waiting_for_the_child() {
+        const CHILD_FLAG: &str = "ADJUTANT_STDIN_EOF_TEST_CHILD";
+        let prompt = "synthetic diagnostic prompt\n".repeat(8_192);
+        if env::var(CHILD_FLAG).is_ok_and(|value| value == "1") {
+            // Re-execute this test as a portable child that cannot finish until it receives EOF.
+            // This avoids depending on a shell, Codex credentials, or an external service.
+            let mut input = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut input).unwrap();
+            assert_eq!(input, prompt);
+            return;
+        }
+        let mut child = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "codex::tests::prompt_delivery_closes_stdin_before_waiting_for_the_child",
+                "--nocapture",
+            ])
+            .env(CHILD_FLAG, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(10), async {
+            send_prompt(stdin, &prompt).await.unwrap();
+            child.wait_with_output().await.unwrap()
+        })
+        .await
+        .expect("the child was left waiting for EOF after prompt delivery");
+        assert!(
+            output.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
 
     #[derive(Clone, Default)]
     struct LogCapture(Arc<Mutex<Vec<u8>>>);
