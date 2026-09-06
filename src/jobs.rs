@@ -281,7 +281,9 @@ async fn process(
             "\n\nCurrent investigation ID: {run_id}. Conversation ID: {}. Use read_investigation for older case notes and attributed staff corrections.",
             job.conversation_id
         );
-        runner.run(run_id, &request, &workspace).await
+        runner
+            .run(run_id, job.conversation_id, &request, &workspace)
+            .await
     });
     tokio::pin!(investigation);
     let mut progress_tick = tokio::time::interval(Duration::from_secs(10));

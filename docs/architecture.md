@@ -80,11 +80,12 @@ Discord output <- final report <- Codex JSONL runner <-> SQLite -> inspection UI
 ## Inspectability
 
 Every run is assigned a time-ordered UUID and moves through `queued`, `running`, `succeeded`, or
-`failed`. The runner uses `codex exec --json --ephemeral --sandbox read-only`; each valid JSONL line
-is appended to SQLite before the final report is marked complete. This exposes all reasoning
-summaries, commands, file changes attempted, MCP calls, web searches, plan events, and errors that
-Codex itself emits. It does not expose private hidden chain-of-thought that the Codex interface does
-not return.
+`failed`. Diagnostics use an ephemeral Codex app-server thread over private stdio with a read-only,
+network-disabled sandbox. Bounded JSONL notifications and steering delivery events are appended to
+SQLite before the final report is marked complete. Conversation routing still uses `codex exec`.
+The inspector exposes emitted reasoning summaries, commands, attempted file changes, MCP calls,
+web searches, plan events, and errors within the configured event budget. It does not expose
+private hidden chain-of-thought that the Codex interface does not return.
 
 The web UI is server-rendered and read-only. It binds to shared loopback and is exposed only through
 Tailscale Serve on private HTTPS port 443. Tailnet ACLs and grants authorize users; the UI has no

@@ -169,15 +169,18 @@ drop from the root init shim to the unprivileged `adjutant` account before runni
 command.
 
 The `-p`/`--profile` option selects a Codex configuration profile; it is not a prompt option.
-Adjutant supplies the prompt over stdin to `codex exec -`. The CLI's JSONL mode is what powers the
-run inspector. Compose mounts
+Adjutant routes short conversations through `codex exec -` and runs diagnostics through a private
+stdio `codex app-server` connection. Diagnostic threads are ephemeral and read-only; JSONL
+notifications power the run inspector and the connection accepts bounded live staff updates.
+Both paths use the same private Codex login state. Compose mounts
 [`deployment/config/codex.toml`](../deployment/config/codex.toml) read-only into the Codex home, so
 the bundled database MCP and its tool allowlist are deployed as reviewed configuration; the named
 volume still owns the private login state.
 
 References: [Codex authentication](https://developers.openai.com/codex/auth),
-[non-interactive mode](https://developers.openai.com/codex/noninteractive), and
-[CLI command reference](https://developers.openai.com/codex/cli/reference).
+[non-interactive mode](https://developers.openai.com/codex/noninteractive),
+[CLI command reference](https://developers.openai.com/codex/cli/reference), and
+[app-server protocol](https://developers.openai.com/codex/app-server).
 
 ## 4. Configure production tools
 

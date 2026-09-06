@@ -41,12 +41,13 @@ async fn main() -> Result<()> {
         config.job_timeout,
         store.clone(),
         collector,
-        runner,
+        runner.clone(),
     );
     let handler = Arc::new(DiscordHandler::new(
         Arc::clone(&config),
         store.clone(),
         queue.clone(),
+        runner,
     ));
     let mut client = Client::builder(&config.discord_token, gateway_intents())
         .event_handler_arc(Arc::clone(&handler))

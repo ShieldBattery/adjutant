@@ -14,7 +14,7 @@ use tracing::{error, info, warn};
 use url::Url;
 use uuid::Uuid;
 
-use crate::codex::{CodexRunner, ConversationAction};
+use crate::codex::{CodexRunner, ConversationAction, SteerOutcome, SteeringUpdate};
 use crate::config::Config;
 use crate::evidence::{Attachment, EvidenceRequest};
 use crate::jobs::{DiagnosticJob, DiscordDelivery, JobQueue, send_notice, update_status};
@@ -35,9 +35,9 @@ pub struct DiscordHandler {
 
 impl DiscordHandler {
     #[must_use]
-    pub fn new(config: Arc<Config>, store: Store, queue: JobQueue) -> Self {
+    pub fn new(config: Arc<Config>, store: Store, queue: JobQueue, runner: CodexRunner) -> Self {
         Self {
-            runner: CodexRunner::new(Arc::clone(&config), store.clone()),
+            runner,
             config,
             store,
             queue,
@@ -105,7 +105,8 @@ impl DiscordHandler {
 
         let linked = self.reply_link(message).await?;
         let bot_id = self.bot_id.load(Ordering::Relaxed);
-        let addressed = directly_addressed(message, bot_id, self.config.discord_mention_role_id);
+        let addressed = directly_addressed(message, bot_id, self.config.discord_mention_role_id)
+            || linked.is_some();
         let question = without_mention(
             &message.content,
             bot_id,
@@ -121,13 +122,16 @@ impl DiscordHandler {
             let acknowledgement = self
                 .respond(context, message, "got your message, taking a look.")
                 .await?;
-            self.link_response(message, &acknowledgement, linked.as_ref())
-                .await?;
+            // The router may steer a newer run or queue a follow-up. Message-to-run links are
+            // immutable, so attach this acknowledgement only after its destination is known.
+            self.cache_message(&acknowledgement).await?;
             Some(acknowledgement)
         } else {
             None
         };
         let Ok(_permit) = Arc::clone(&self.conversations).try_acquire_owned() else {
+            self.link_acknowledgement(message, acknowledgement.as_ref(), linked.as_ref())
+                .await?;
             if addressed {
                 let sent = self
                     .respond(
@@ -140,10 +144,26 @@ impl DiscordHandler {
             }
             return Ok(());
         };
-        let decision_context = self.conversation_context(message, linked.as_ref()).await?;
+        // Pin the target before triage. A late result must never steer a replacement run.
+        let steer_target = if can_steer_message(
+            message,
+            linked.as_ref(),
+            &self.config.shieldbattery_public_url,
+        ) {
+            linked
+                .as_ref()
+                .and_then(|link| Uuid::parse_str(&link.conversation_id).ok())
+                .and_then(|conversation| self.runner.steering_target(conversation))
+        } else {
+            None
+        };
+        let decision_context = self
+            .conversation_context(message, linked.as_ref(), steer_target)
+            .await?;
         let decision_result = tokio::select! {
             biased;
             () = self.shutdown.cancelled() => {
+                self.link_acknowledgement(message, acknowledgement.as_ref(), linked.as_ref()).await?;
                 if addressed
                     && let Ok(sent) = self.respond(
                         context,
@@ -161,6 +181,8 @@ impl DiscordHandler {
             Ok(decision) => decision,
             Err(error) => {
                 warn!(message_id = message.id.get(), %error, "conversational routing failed");
+                self.link_acknowledgement(message, acknowledgement.as_ref(), linked.as_ref())
+                    .await?;
                 if addressed {
                     let sent = self
                         .respond(
@@ -174,6 +196,13 @@ impl DiscordHandler {
                 return Ok(());
             }
         };
+        if !matches!(
+            decision.action,
+            ConversationAction::Investigate | ConversationAction::Steer
+        ) {
+            self.link_acknowledgement(message, acknowledgement.as_ref(), linked.as_ref())
+                .await?;
+        }
         if let Some(link) = &linked
             && matches!(decision.action, ConversationAction::Remember)
         {
@@ -202,6 +231,16 @@ impl DiscordHandler {
                     RunKind::StaffRequest,
                     linked.as_ref(),
                     acknowledgement.as_ref(),
+                )
+                .await?;
+            }
+            ConversationAction::Steer => {
+                self.steer_or_follow_up(
+                    context,
+                    message,
+                    linked.as_ref(),
+                    acknowledgement.as_ref(),
+                    steer_target,
                 )
                 .await?;
             }
@@ -234,6 +273,84 @@ impl DiscordHandler {
             }
         }
         Ok(())
+    }
+
+    async fn steer_or_follow_up(
+        &self,
+        context: &Context,
+        message: &Message,
+        linked: Option<&RunLink>,
+        acknowledgement: Option<&Message>,
+        target: Option<Uuid>,
+    ) -> Result<()> {
+        let Some(link) = linked else {
+            let sent = self
+                .respond(
+                    context,
+                    message,
+                    "reply to the investigation you want to update so i know where to add that.",
+                )
+                .await?;
+            self.link_response(message, &sent, None).await?;
+            return Ok(());
+        };
+        if let Some(run_id) = target
+            .filter(|_| can_steer_message(message, linked, &self.config.shieldbattery_public_url))
+        {
+            let update = SteeringUpdate {
+                guild_id: self.config.discord_guild_id,
+                channel_id: message.channel_id.get(),
+                message_id: message.id.get(),
+                author_id: message.author.id.get(),
+                author: message.author.name.clone(),
+                text: message.content.clone(),
+                source_url: message.link(),
+            };
+            let outcome = self.runner.steer(run_id, update).await;
+            match outcome {
+                SteerOutcome::Accepted | SteerOutcome::Uncertain => {
+                    let target_link = RunLink {
+                        run_id: run_id.to_string(),
+                        conversation_id: link.conversation_id.clone(),
+                    };
+                    self.link_acknowledgement(message, acknowledgement, Some(&target_link))
+                        .await?;
+                    let response = if outcome == SteerOutcome::Accepted {
+                        if let Err(error) = self
+                            .store
+                            .save_case_observation(
+                                Uuid::parse_str(&link.conversation_id)?,
+                                &message.link(),
+                                &message.content,
+                            )
+                            .await
+                        {
+                            warn!(%run_id, %error, "could not save an accepted staff update as case context");
+                        }
+                        "added that to the investigation i'm running."
+                    } else {
+                        "i couldn't confirm that update reached the investigation. check the run inspector before sending it again."
+                    };
+                    let sent = self.respond(context, message, response).await?;
+                    self.link_response(message, &sent, Some(&target_link))
+                        .await?;
+                    return Ok(());
+                }
+                SteerOutcome::Unavailable | SteerOutcome::Full | SteerOutcome::TooLarge => {
+                    info!(%run_id, ?outcome, "queuing staff update as a follow-up investigation");
+                }
+            }
+        }
+        // The target finished, is saturated, or this update needs evidence collection. Retain the
+        // original message and normal archive/queue limits through the existing follow-up path.
+        self.submit(
+            context,
+            message,
+            RunKind::StaffRequest,
+            linked,
+            acknowledgement,
+        )
+        .await
     }
 
     async fn reply_link(&self, message: &Message) -> Result<Option<RunLink>> {
@@ -277,6 +394,7 @@ impl DiscordHandler {
         &self,
         message: &Message,
         linked: Option<&RunLink>,
+        steer_target: Option<Uuid>,
     ) -> Result<String> {
         let recent = self
             .store
@@ -294,6 +412,7 @@ impl DiscordHandler {
             "current_message":{"guild_id":self.config.discord_guild_id.to_string(),"channel_id":message.channel_id.get().to_string(),"message_id":message.id.get().to_string(),"author":message.author.name,"content":truncate(&message.content,8000),"attachments":message.attachments.iter().take(20).map(|a| truncate(&a.filename,100)).collect::<Vec<_>>()},
             "recent_messages":recent,"referenced_message":reply,"linked_investigation":linked,
             "active_investigations":active,
+            "steerable_investigation":steer_target.map(|id| json!({"run_id":id})),
             "staff_alerts_channel":self.config.discord_bug_report_channel_id.to_string(),
             "command_center_channel":self.config.discord_request_channel_id.to_string(),
         }))
@@ -382,6 +501,18 @@ impl DiscordHandler {
             ),
         )
         .await??)
+    }
+
+    async fn link_acknowledgement(
+        &self,
+        source: &Message,
+        acknowledgement: Option<&Message>,
+        linked: Option<&RunLink>,
+    ) -> Result<()> {
+        if let Some(acknowledgement) = acknowledgement {
+            self.link_response(source, acknowledgement, linked).await?;
+        }
+        Ok(())
     }
 
     async fn link_response(
@@ -672,6 +803,14 @@ fn bounded_conversation_context(mut context: serde_json::Value) -> Result<String
     }
 }
 
+fn can_steer_message(message: &Message, linked: Option<&RunLink>, public_url: &Url) -> bool {
+    linked.is_some()
+        && message.attachments.is_empty()
+        && !message.content.trim().is_empty()
+        && find_game_id(&message.content, public_url).is_none()
+        && find_bug_report_id(&message.content, public_url).is_none()
+}
+
 fn directly_addressed(message: &Message, bot_id: u64, mention_role_id: Option<u64>) -> bool {
     (bot_id != 0
         && (message.mentions.iter().any(|user| user.id.get() == bot_id)
@@ -888,6 +1027,38 @@ mod tests {
             decoded["active_investigations"][0]["run_id"],
             id.to_string()
         );
+    }
+
+    #[test]
+    fn steering_requires_a_link_and_keeps_artifacts_on_the_collector_path() {
+        let public_url = Url::parse("https://shieldbattery.invalid").unwrap();
+        let link = RunLink {
+            run_id: Uuid::now_v7().to_string(),
+            conversation_id: Uuid::now_v7().to_string(),
+        };
+        let mut message = Message::default();
+        message.content = "actually, this started around 03:00 UTC".to_owned();
+        assert!(can_steer_message(&message, Some(&link), &public_url));
+        assert!(!can_steer_message(&message, None, &public_url));
+        message.content = "  ".to_owned();
+        assert!(!can_steer_message(&message, Some(&link), &public_url));
+        message.content = format!("check game_id {}", Uuid::now_v7());
+        assert!(!can_steer_message(&message, Some(&link), &public_url));
+        message.content = format!(
+            "https://shieldbattery.invalid/admin/bug-reports/{}",
+            Uuid::now_v7()
+        );
+        assert!(!can_steer_message(&message, Some(&link), &public_url));
+        message.content = "extra logs".to_owned();
+        message.attachments.push(
+            serde_json::from_value(json!({
+                "id":"1", "filename":"logs.zip", "size":42,
+                "url":"https://cdn.discordapp.com/attachments/1/2/logs.zip",
+                "proxy_url":"https://cdn.discordapp.com/attachments/1/2/logs.zip"
+            }))
+            .unwrap(),
+        );
+        assert!(!can_steer_message(&message, Some(&link), &public_url));
     }
 
     #[test]

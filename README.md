@@ -24,9 +24,10 @@ errors.
   aggregate ZIP expansion/file count, event history, process count, and end-to-end runtime are bounded.
 - The Discord credential and any legacy `ADJUTANT_UI_TOKEN` value never enter the Codex child
   environment.
-- Codex runs with `codex exec --ephemeral --json --sandbox read-only` against a read-only source
-  mount and approved read-only MCPs. Its model-generated commands have no network access, even
-  though the parent service shares the sidecar's Tailnet connection.
+- Diagnostic runs use an ephemeral Codex app-server thread over private stdio, with a read-only
+  sandbox and approved read-only MCPs. Short conversation routing uses `codex exec`. Model-generated
+  commands have no network access, even though the parent service shares the sidecar's Tailnet
+  connection.
 - A credential-free Rust source synchronizer discovers the organization's public GitHub
   repositories and atomically refreshes persistent, read-only snapshots without rebuilding or
   redeploying Adjutant.
@@ -40,8 +41,10 @@ errors.
   read-only service identity; neither Codex nor model-generated commands receive its token.
 - `deployment/` is a copyable, image-only VM bundle, and the GitHub Actions workflow publishes the
   bot/source-sync and MCP Dockerfile targets as separate GHCR images.
-- Native message replies connect follow-ups; substantive progress notes and status lookups keep
-  staff informed. Bounded recent context can expand through paginated channel history, and
+- Native message replies can steer an active investigation with relevant text corrections or
+  changes of focus. Attachments and updates that cannot enter the active run become ordered
+  follow-up investigations. Substantive progress notes and status lookups keep staff informed.
+  Bounded recent context can expand through paginated channel history, and
   searchable case notes preserve past findings and attributed corrections. See the
   [Discord interaction guide](docs/discord-interaction.md).
 - Results are posted inline when possible and attached as `diagnosis.md` when too long for Discord.

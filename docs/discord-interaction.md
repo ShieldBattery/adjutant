@@ -9,10 +9,12 @@ and `DISCORD_BUG_REPORT_CHANNEL_ID` to staff-alerts. Startup rejects a third out
 The configured application webhook in staff-alerts starts automatic bug-report diagnoses;
 their acknowledgements and results appear in command-center with a link to the alert.
 Other bots and webhooks never trigger a conversation. Human staff can address Adjutant in
-either channel. An explicit user mention, a reply to Adjutant, or an optional configured
-`DISCORD_MENTION_ROLE_ID` mention gets an immediate acknowledgement. That role only controls
+either channel. An explicit user mention, a reply linked to an investigation or addressed to
+Adjutant, or an optional configured `DISCORD_MENTION_ROLE_ID` mention gets an immediate
+acknowledgement. That role only controls
 addressing; it does not grant access. Ordinary messages go through a short Astra routing decision,
-which can stay quiet, answer briefly, ask a clarification, report status, or start an investigation.
+which can stay quiet, answer briefly, ask a clarification, report status, steer active work,
+or start an investigation.
 Ordinary staff chatter should remain ordinary chatter. Enable Discord's privileged Message Content
 Intent for this judgment.
 
@@ -32,6 +34,35 @@ bug-report diagnoses post in command-center and use their dashboard as the reply
 Discord reply cannot cross channels. Separate conversations can run concurrently; diagnostic
 follow-ups in the same conversation queue in order. A greeting or clarification does not consume a
 diagnostic slot. All outbound messages suppress automatic user, role, and everyone mentions.
+
+## Updating an investigation
+
+Reply to an investigation's acknowledgement, dashboard, progress message, original request, or
+result to give it more context. For example: "actually, this started around 03:00 UTC" or
+"focus on the reconnect path first." The router distinguishes relevant diagnostic updates from
+status questions, greetings, unrelated requests, and requests for a separate investigation.
+Adjutant acknowledges the reply immediately and confirms delivery once Codex accepts the update.
+Accepted updates stay in the same run, preserve the original staff text and message attribution,
+are recorded within the inspection event budget, and are saved as attributed case observations.
+
+The service pins the active run before routing the message. A completion race cannot redirect
+an update into a different run. If the target finishes or cannot accept more updates, Adjutant
+queues a normal follow-up in the same conversation. Attachments, game links/explicit game IDs,
+and report links also use that path so evidence downloads and archive limits still apply.
+If delivery becomes uncertain after sending, Adjutant says so instead of automatically submitting
+the same input twice. The inspector shows the recorded delivery outcome when available.
+
+Each run accepts at most 16 update submissions and 128 KiB of serialized staff updates, with at
+most eight waiting in its mailbox and 32 KiB per update. Updates share the investigation's
+original deadline and output limits; they cannot extend its lifetime or change its sandbox,
+credentials, model, or tool policy. Staff can request another investigation when more work is needed.
+
+Diagnostics use a private stdio Codex app-server connection and an ephemeral thread. The service
+uses only initialization, thread creation, turn start, and turn steering; it rejects requests for
+approvals, extra permissions, or interactive tools. It exposes no app-server network listener.
+Every protocol frame, including a complete final message, must fit `MAX_CODEX_EVENT_LINE_BYTES`.
+An oversized frame fails the run explicitly; event-budget exhaustion stops retaining audit events
+while still allowing bounded control messages and the final report to complete.
 
 ## Progress and status
 
