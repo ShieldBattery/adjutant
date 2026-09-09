@@ -66,6 +66,8 @@ struct ManifestRepository {
 struct Manifest {
     organization: String,
     generated_at: u64,
+    #[serde(default)]
+    git_depth: u32,
     repositories: Vec<ManifestRepository>,
 }
 
@@ -212,6 +214,7 @@ async fn sync_once(config: &Config, client: &Client) -> Result<()> {
     let manifest = Manifest {
         organization: config.organization.clone(),
         generated_at: unix_timestamp()?,
+        git_depth: config.git_depth,
         repositories: recorded,
     };
     if current_manifest_matches(&config.root, &manifest)? {
@@ -740,7 +743,9 @@ fn current_manifest_matches(root: &Path, desired: &Manifest) -> Result<bool> {
 }
 
 fn manifest_matches(current: &Manifest, desired: &Manifest) -> bool {
-    current.organization == desired.organization && current.repositories == desired.repositories
+    current.organization == desired.organization
+        && current.git_depth == desired.git_depth
+        && current.repositories == desired.repositories
 }
 
 fn replace_current_link(root: &Path, generation_id: &str) -> Result<()> {
@@ -1116,14 +1121,56 @@ mod tests {
         let old = Manifest {
             organization: "ShieldBattery".to_owned(),
             generated_at: 1,
+            git_depth: 200,
             repositories: repositories.clone(),
         };
         let new = Manifest {
             organization: "ShieldBattery".to_owned(),
             generated_at: 2,
+            git_depth: 200,
             repositories,
         };
         assert!(manifest_matches(&old, &new));
+    }
+
+    #[test]
+    fn manifest_comparison_rejects_changed_git_depth() {
+        let repositories = vec![ManifestRepository {
+            name: "repo".to_owned(),
+            default_branch: "main".to_owned(),
+            commit: "a".repeat(40),
+        }];
+        let current = Manifest {
+            organization: "ShieldBattery".to_owned(),
+            generated_at: 1,
+            git_depth: 200,
+            repositories: repositories.clone(),
+        };
+        for git_depth in [199, 201] {
+            let desired = Manifest {
+                organization: "ShieldBattery".to_owned(),
+                generated_at: 2,
+                git_depth,
+                repositories: repositories.clone(),
+            };
+            assert!(!manifest_matches(&current, &desired));
+        }
+    }
+
+    #[test]
+    fn legacy_manifest_is_readable_but_does_not_match_depth_aware_request() {
+        let legacy: Manifest = serde_json::from_str(
+            r#"{"organization":"ShieldBattery","generated_at":1,"repositories":[]}"#,
+        )
+        .expect("legacy manifest");
+        assert_eq!(legacy.git_depth, 0);
+        let desired = Manifest {
+            organization: "ShieldBattery".to_owned(),
+            generated_at: 2,
+            git_depth: 200,
+            repositories: Vec::new(),
+        };
+        assert!(!manifest_matches(&legacy, &desired));
     }
 
     #[test]
@@ -1148,6 +1195,7 @@ mod tests {
         let manifest = Manifest {
             organization: "ShieldBattery".to_owned(),
             generated_at: 1,
+            git_depth: 200,
             repositories: vec![repository.clone(), repository],
         };
         assert!(validate_manifest(&manifest).is_err());
@@ -1193,6 +1241,7 @@ mod tests {
         let manifest = Manifest {
             organization: "ShieldBattery".to_owned(),
             generated_at: 1,
+            git_depth: 200,
             repositories: vec![ManifestRepository {
                 name: "current".to_owned(),
                 default_branch: "main".to_owned(),
@@ -1221,6 +1270,7 @@ mod tests {
             &Manifest {
                 organization: "ShieldBattery".to_owned(),
                 generated_at: 0,
+                git_depth: 200,
                 repositories: Vec::new(),
             },
         )

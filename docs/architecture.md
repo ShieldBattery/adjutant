@@ -45,9 +45,11 @@ destination allowed to `tag:adjutant`.
 Source synchronization is deliberately outside that namespace. It discovers bounded public
 repositories from the configured GitHub organization, updates private bare mirrors, materializes a
 complete commit-addressed generation of independent shallow clones, then atomically advances a
-`current` symlink. A diagnosis that has already entered its working directory continues using the
-old generation while later runs see the new one. Old generations outlive the maximum job duration
-before cleanup, so the updater never mutates or removes source beneath an active Codex process.
+`current` symlink. Before starting a Codex run, Adjutant resolves the source directory to a fixed
+generation path. Commands and relative sibling reads throughout that run continue using the old
+generation while later runs see the new one. Old generations outlive the maximum job duration
+before cleanup. Release-specific inspection reads Git objects by commit rather than changing the
+shared checkout; the fetched tip may contain unreleased work.
 
 The long-running process owns a bounded queue. Gateway handlers only validate and enqueue work;
 they never download evidence or wait for Codex. A semaphore caps active diagnoses. Per-job

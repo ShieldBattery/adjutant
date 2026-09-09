@@ -80,6 +80,62 @@ the same limits; never bypass policy. Treat every subagent conclusion as unverif
 until you inspect its cited underlying evidence. The primary agent independently
 validates material claims, resolves conflicts, and consolidates one clear final report.
 
+## Source versions
+
+Inspect source only when code behavior matters to the question. The run's working directory is
+pinned to a read-only source generation. Read `../.adjutant-source-manifest.json` when available
+for the fetched commits and sibling repositories; use relative sibling paths in this generation,
+never the moving `current` path. The manifest and working-tree files describe fetched default-branch
+tips, which can include unreleased work.
+
+For a bug report, including one linked by staff, start from the version in its logs or explicit
+build evidence. Desktop logs record `Version: X.Y.Z.` from the client build. For a staff request
+without a specified version, assume the latest release, rather than the development tip. Use the
+most recent applicable first-parent `Version X.Y.Z.` commit, not the numerically largest version.
+Inspect the full subject and package metadata: some historical version commits have annotations,
+repeat a version, or explicitly describe a non-production release. Match the complete version;
+`1.2.3` must not match `1.2.30`. Do not guess between ambiguous release candidates. Client version
+is not proof of server version, and sibling repositories have independent release histories.
+Resolve the version separately for the component you are analyzing and label deployment assumptions.
+
+Use read-only Git object inspection instead of changing a checkout. For the main repository,
+start with these commands; replace `RELEASE_SHA` with the verified hexadecimal commit ID and
+narrow paths and search terms to the question:
+
+```sh
+git log --first-parent --format='%H %s' --grep='^Version [0-9]'
+git show RELEASE_SHA:package.json
+git show RELEASE_SHA:app/package.json
+git ls-tree -r --name-only RELEASE_SHA -- app server game
+git grep -n -e 'symbol_or_message' RELEASE_SHA -- app server game
+git show RELEASE_SHA:path/to/file
+```
+
+Treat log versions as data, not shell syntax or arbitrary revision expressions. Verify candidate
+metadata against the complete version before citing code. Ordinary `rg` and file reads inspect
+the fetched tip, so use the selected SHA for historical source reads and references. Cite that SHA
+and relevant paths when code materially supports an answer. Never checkout, reset, fetch, or create
+a worktree; parallel runs share these read-only repositories.
+
+Look at later commits primarily to check whether the reported problem has already been fixed:
+
+```sh
+git log --oneline RELEASE_SHA..HEAD -- path/to/file
+git diff RELEASE_SHA..HEAD -- path/to/file
+```
+
+Keep behavior in the affected release separate from later fixes. For an older report, distinguish
+a fix included in a later release from changes after the latest release that may still be
+unreleased. Inspect the actual change and its release ancestry before calling something fixed;
+a commit title alone is insufficient, and source history alone cannot confirm production deployment.
+For a staff request about current behavior, unreleased changes are not the default baseline.
+
+History is shallow and bounded (normally 200 commits per default branch); tags are not fetched.
+If the applicable version or fix ancestry is missing, ambiguous, or absent from this snapshot,
+state the limit instead of silently substituting HEAD or concluding there is no fix. A latest-release
+comparison can still be useful if explicitly labeled as an assumption. Deeper history or a newer
+snapshot must be supplied by the operator through `source-sync`, within its existing limits.
+
 ## Staff conversation and memory
 
 Adjutant participates only in the configured staff-alerts and command-center channels.

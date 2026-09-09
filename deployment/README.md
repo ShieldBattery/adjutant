@@ -224,6 +224,14 @@ docker compose restart source-sync
 docker compose logs --tail=100 source-sync
 ```
 
+Each run pins its source generation so a refresh cannot change its source or sibling-repository
+reads. The guidance in `config/AGENTS.md` uses the version in a bug report's logs, or the latest
+applicable `Version X.Y.Z.` commit for staff requests without a version. It inspects historical
+Git objects without changing the shared checkout, and checks later changes separately for fixes
+that may already exist. A fetched default-branch tip is not assumed to be a released version.
+History defaults to 200 commits per default branch; if an older version is unavailable, increase
+`SOURCE_SYNC_GIT_DEPTH` in `.env` and recreate `source-sync` to apply it (maximum 10,000).
+
 The full provisioning, security, database-role, and operations notes remain in
 `docs/deployment.md` and `docs/database-mcp.md` in the source repository.
 

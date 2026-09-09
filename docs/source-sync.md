@@ -23,13 +23,15 @@ Each refresh follows this sequence:
    shallow bare mirror.
 2. Resolve every repository to an exact commit.
 3. Materialize independent shallow clones for all repositories together in a staging generation.
-4. Write `.adjutant-source-manifest.json` with the selected branch and commit for every repository.
+4. Write `.adjutant-source-manifest.json` with the requested history depth and the selected branch
+   and commit for every repository.
 5. Rename the complete staging directory and atomically advance the `current` symlink.
 
-Adjutant starts Codex in `current/ShieldBattery`. Sibling repositories are available one directory
-above, and the prompt tells Codex to read the manifest and cite materially relevant commits. Once a
-process enters a generation, a later symlink update does not move its working directory. Old
-generations are retained long enough for in-flight diagnoses before conservative cleanup.
+At run startup, Adjutant resolves `current/ShieldBattery` to its canonical generation path and
+passes that fixed directory to Codex. Later commands and relative sibling-repository reads keep
+using the same generation even when `current` advances. The prompt tells Codex to read the manifest
+one directory above and cite materially relevant commits. Old generations are retained long enough
+for in-flight runs before conservative cleanup.
 
 The clones do not borrow objects from the mutable mirrors, so mirror pruning cannot invalidate a
 published generation.
@@ -39,6 +41,38 @@ generation. On a first installation, Compose holds Adjutant until the initial ge
 An incomplete refresh is never published. Publication is atomic during normal operation. After an
 abrupt host or container failure, the health check rejects incomplete state and the next startup
 removes abandoned staging directories before rebuilding.
+
+## Selecting the relevant release
+
+The manifest records fetched default-branch tips, not deployed releases. Agent guidance selects
+source according to the question:
+
+- For a bug report, use the version recorded in its logs or explicit build evidence, even when
+  the report arrived through a staff request and concerns an older release.
+- For a staff request without a version, assume the latest applicable release commit. ShieldBattery
+  normally records releases as `Version X.Y.Z.` commit subjects; tags are not required or fetched.
+- Inspect later commits separately to see whether a reported problem has already been fixed.
+  Distinguish fixes included in later releases from changes after the latest release that may
+  still be unreleased. Source history alone does not confirm what is deployed.
+
+Codex inspects first-parent release candidates and their package metadata, then reads historical
+files with `git show SHA:path`, searches with `git grep -n -e pattern SHA -- path`, and compares
+relevant changes with `git log SHA..HEAD -- path` and `git diff SHA..HEAD -- path`. It does not check
+out a release or create a worktree. Multiple runs can inspect different releases in the same
+read-only generation without changing files or refs. Ordinary working-tree reads still show the
+fetched tip, so version-specific conclusions must cite the selected commit.
+
+Release selection is evidence-driven guidance, not a deterministic claim that any version-looking
+commit was deployed. Historical subjects can repeat versions or include annotations. Client log
+versions do not establish the deployed server version, and sibling repositories have independent
+release histories. Ambiguity and assumptions must be stated in the answer.
+
+History is bounded by `SOURCE_SYNC_GIT_DEPTH` (200 by default, at most 10,000). If an older version
+or relevant ancestry is missing, Codex reports that limit instead of silently using HEAD. The
+operator can increase the depth in `.env` and run `docker compose up -d --force-recreate source-sync`
+to apply it. Changing depth publishes a new generation even if repository tips are unchanged.
+Deeper history increases fetch and storage costs; retain the existing size, runtime, and
+generation-retention bounds. Newly retained history is available to runs using a new published generation.
 
 ## Configuration
 

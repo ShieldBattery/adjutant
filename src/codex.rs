@@ -5,7 +5,7 @@ pub(crate) use steering::{SteerOutcome, SteeringUpdate};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -317,23 +317,17 @@ impl CodexRunner {
     ) -> Result<String> {
         let started = Instant::now();
         info!("starting Codex investigation");
-        let source_available = self.config.shieldbattery_source_dir.is_dir();
-        let working_directory = if source_available {
-            &self.config.shieldbattery_source_dir
-        } else {
-            &workspace.root
-        };
-        let source_manifest_available = source_available
-            && self
-                .config
-                .shieldbattery_source_dir
-                .parent()
-                .is_some_and(|parent| parent.join(".adjutant-source-manifest.json").is_file());
+        let source_directory = resolve_source_directory(&self.config.shieldbattery_source_dir)?;
+        let working_directory = source_directory.as_deref().unwrap_or(&workspace.root);
+        let source_manifest_available = source_directory
+            .as_deref()
+            .and_then(Path::parent)
+            .is_some_and(|parent| parent.join(".adjutant-source-manifest.json").is_file());
         let prompt = build_prompt(
             request,
             workspace,
             kind,
-            source_available,
+            source_directory.is_some(),
             source_manifest_available,
         );
         let report = app_server::run(
@@ -755,6 +749,23 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
     }
     &value[..end]
 }
+fn resolve_source_directory(configured: &Path) -> Result<Option<PathBuf>> {
+    // App-server reuses this path for later commands. Resolve `current` once so a refresh
+    // cannot move an active run (or its sibling repository reads) to a new generation.
+    match configured.canonicalize() {
+        Ok(directory) => Ok(directory.is_dir().then_some(directory)),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error).context("failed to resolve the source snapshot directory"),
+    }
+}
+
 fn build_prompt(
     request: &str,
     workspace: &EvidenceWorkspace,
@@ -771,10 +782,12 @@ fn build_prompt(
         }
     };
     let source_note = if source_manifest_available {
-        "The current working directory is a read-only snapshot of the main ShieldBattery \
+        "The current working directory is pinned to a read-only generation of the main ShieldBattery \
 repository. Consistent snapshots of the other public ShieldBattery organization repositories are \
 its siblings. Read the source manifest at ../.adjutant-source-manifest.json and use sibling \
-repositories when relevant; report the commit IDs that materially support the answer."
+repositories through these generation-relative paths, not through the moving current symlink. \
+The manifest records fetched default-branch commits, not deployed versions; report the commit IDs \
+that materially support the answer."
             .to_owned()
     } else if source_available {
         "The current working directory is the read-only ShieldBattery source tree.".to_owned()
@@ -789,6 +802,7 @@ repositories when relevant; report the commit IDs that materially support the an
 
 Use the source tree only when the question depends on code behavior.
 {source_note}
+When code behavior matters, select the relevant release before reading source. For a bug report (including one supplied in a staff request), use the version recorded in its logs or explicit build evidence. For a staff request without a specified version, use the latest release commit on the fetched default branch as the assumed current release. ShieldBattery normally records releases with commit subjects like `Version X.Y.Z.` rather than tags. Inspect first-parent version commits and verify the candidate's package metadata; do not confuse a version prefix, an annotated non-production release, or default-branch HEAD with the applicable release. Client logs identify the client version, not necessarily the deployed server or a sibling repository's version. If the version is unknown, ambiguous, or outside the retained shallow history, state that limitation; do not silently substitute HEAD or claim a candidate was deployed. Inspect the selected SHA with read-only `git show SHA:path`, `git grep -n -e pattern SHA -- path`, and `git ls-tree`; working-tree files reflect the fetched tip. Compare relevant commits after that release separately to check whether the problem was already fixed, distinguishing a fix in a later release from an unreleased change. A later fix does not change what the affected version did, and source alone does not prove a fix is deployed. Never checkout, reset, fetch, or create a worktree. Keep all reads within this run's pinned generation.
 Evidence is in: {evidence}
 The evidence manifest is: {manifest}
 
@@ -1234,6 +1248,67 @@ async fn read_bounded_text(path: &Path, max_bytes: u64, description: &str) -> Re
 mod tests {
     use super::*;
     use crate::store::{NewRun, RunKind};
+
+    #[test]
+    fn missing_source_directory_preserves_the_evidence_only_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(
+            resolve_source_directory(&root.path().join("missing"))
+                .unwrap()
+                .is_none()
+        );
+        let file = root.path().join("file");
+        std::fs::write(&file, "not a source directory").unwrap();
+        assert!(resolve_source_directory(&file).unwrap().is_none());
+        assert!(
+            resolve_source_directory(&file.join("ShieldBattery"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // Production publishes POSIX symlinks; exercise that boundary on Unix without requiring
+    // Windows developer mode or administrator privileges for the rest of the test suite.
+    #[cfg(unix)]
+    #[test]
+    fn source_refresh_keeps_active_runs_and_sibling_reads_on_their_generation() {
+        use std::os::unix::fs::symlink as link_directory;
+
+        let root = tempfile::tempdir().unwrap();
+        for generation in ["old", "new"] {
+            let directory = root.path().join("generations").join(generation);
+            std::fs::create_dir_all(directory.join("ShieldBattery")).unwrap();
+            std::fs::create_dir_all(directory.join("sibling")).unwrap();
+            std::fs::write(directory.join("ShieldBattery/source.txt"), generation).unwrap();
+            std::fs::write(directory.join("sibling/source.txt"), generation).unwrap();
+            std::fs::write(directory.join(".adjutant-source-manifest.json"), generation).unwrap();
+        }
+        let current = root.path().join("current");
+        link_directory(Path::new("generations").join("old"), &current).unwrap();
+        let configured = current.join("ShieldBattery");
+        let active_run = resolve_source_directory(&configured).unwrap().unwrap();
+
+        // Publish a new generation after the first run has selected its cwd.
+        std::fs::remove_file(&current).unwrap();
+        link_directory(Path::new("generations").join("new"), &current).unwrap();
+        let later_run = resolve_source_directory(&configured).unwrap().unwrap();
+
+        for (directory, expected) in [(active_run, "old"), (later_run, "new")] {
+            assert_eq!(
+                std::fs::read_to_string(directory.join("source.txt")).unwrap(),
+                expected
+            );
+            let generation = directory.parent().unwrap();
+            assert_eq!(
+                std::fs::read_to_string(generation.join("sibling/source.txt")).unwrap(),
+                expected
+            );
+            assert_eq!(
+                std::fs::read_to_string(generation.join(".adjutant-source-manifest.json")).unwrap(),
+                expected
+            );
+        }
+    }
 
     #[tokio::test]
     async fn prompt_delivery_closes_stdin_before_waiting_for_the_child() {
