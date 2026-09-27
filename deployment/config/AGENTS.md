@@ -41,6 +41,30 @@ local paths and update the manifest through Adjutant's bounded internal API coll
 Inspect those files with read-only commands. Do not open staff-facing admin pages or guess
 private download URLs. If collection is unavailable or reaches its limits, report that blocker.
 
+For moderation and linked-account questions, use `database_schema` to check which
+`adjutant_diagnostics` views are deployed, then bounded `query_database` reads. The moderation
+views include `user_bans`, `user_restrictions`, `matchmaking_bans`, `user_identifier_bans`,
+and `user_identifier_restrictions`. Their `user_id` associations are evidence, not an
+effective-punishment verdict; `first_user_id` or `triggered_by` identifies the originating
+account. Automatic ban `expires_at` ends queue exclusion; `clears_at` ends escalation decay,
+and the periodic `cleared` flag can lag behind it. Compare legacy account/identifier-ban
+timestamps with `CURRENT_TIMESTAMP AT TIME ZONE 'UTC'`; restriction and matchmaking times
+are timezone-aware.
+
+Use `matchmaking_completions` for per-user queue outcomes (`found`, `cancel`, `disconnect`),
+search duration, and queue-time rating. Its `completion_time` is legacy UTC and it has no game
+ID; `found` is not proof that a game launched. `matchmaking_formations` also includes failed
+starts: `game_id IS NULL` with `fail_phase` accepting, drafting, or loading. Filter outcome
+queries by user and/or a short time window. Formation logs are best-effort telemetry.
+
+`user_identifiers` contains per-account/type usage aggregates, not hashes. Find linked-account
+candidates through `user_identifier_matches`, always filtering by the target `user_id`.
+Count distinct `identifier_type` values, not matching hashes; type 0 is excluded. The production
+source normally requires four types, but check the relevant version before inferring enforcement.
+Shared identifiers do not prove two accounts belong to the same person. Free-form moderation
+notes and ban reasons are unavailable; do not invent them. Punishment records can be updated
+or cleaned up, so absence is not proof that an account was never punished.
+
 Keep final reports easy to skim. The Discord reply already links to the request, so do not add
 another title or repeat the request. Lead with the direct answer or a short summary. Include
 next checks only for useful follow-up on an unresolved question or diagnostic finding, with at

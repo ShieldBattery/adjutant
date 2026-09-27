@@ -51,6 +51,16 @@ snapshots in a persistent volume.
 `datadog-mcp.env` contains the dedicated read-only Datadog service token and its site's managed MCP
 hostname.
 
+Provision the database MCP's dedicated roles and base views using `docs/database-mcp.md` in the
+source repository. Then, as the database administrator connected to the ShieldBattery database,
+apply `sql/moderation-views.sql` with `psql -v ON_ERROR_STOP=1 -f sql/moderation-views.sql` using
+your normal administrator connection configuration. This also upgrades existing installations.
+It requires ShieldBattery's `20260913120000_add_unban_columns_to_user_bans.sql` migration and
+earlier moderation tables, queue-time rating (`20260625120000`), and failed formations
+(`20260628120000`). The script can be reapplied and adds ban/restriction records, queue outcomes,
+failed match formations, and shared-identifier account evidence to the existing MCP SQL tools. It exposes no stored identifier
+hashes or free-form staff notes. No MCP image update or restart is needed for these views.
+
 The repository workflow publishes `ghcr.io/<owner>/<repository>` and
 `ghcr.io/<owner>/<repository>-mcp`. GHCR initially creates packages as private; make both packages
 public in GitHub's package settings if anonymous VM pulls are preferred. Otherwise authenticate the
